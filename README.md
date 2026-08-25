@@ -48,8 +48,8 @@ You can find the pre-compiled version at [Releases](https://github.com/INTERINIT
 **Preparations before starting** <br />
 Before you begin, you will need a complete Simon dump. <br />
 The dump should consist of the following parts: <br />
-1.Dump Simon's 1MB FlashROM, named "SIMONFlash.bin" <br />
-2.Dump Simon's 128KB BIOS chip, named "simonbios.bin" <br />
+1.Simon's 1MB FlashROM, named "SIMONFlash.bin" <br />
+2.Simon's 128KB BIOS chip, named "simonbios.bin" <br />
 (The above two files should be placed in `\roms\ibmsimon`)<br />
 
 *For some reason, this project does not provide any dump copies, but you can follow This [Project](https://github.com/INTERINIT/SimonDump).*
