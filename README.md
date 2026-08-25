@@ -6,7 +6,7 @@ An IBM Simon Emulator Based on MAME<br />
 [![LICENSE](https://img.shields.io/badge/LICENSE-GPL2.0-blue.svg?style=for-the-badge)](https://github.com/Inter1006/PenPointOS_Vbox/blob/main/LICENSE )
 
 Language  语言<br />
-[简体中文]([https://www.freedos.org/](https://www.youtube.com/watch?v=dQw4w9WgXcQ))  |  ENGLISH<br />
+[简体中文](https://www.youtube.com/watch?v=dQw4w9WgXcQ)  |  ENGLISH<br />
 
 
 </div>
@@ -50,7 +50,7 @@ The dump should consist of the following parts: <br />
 2.Dump Simon's 128KB BIOS chip, named "simonbios.bin" <br />
 (The above two files should be placed in `\roms\ibmsimon`)<br />
 
-*For some reason, this project does not provide any dump copies, but you can follow This [Project](www.114.com).*
+*For some reason, this project does not provide any dump copies, but you can follow This [Project](https://github.com/INTERINIT/SimonDump).*
 
 **Use the virtual AMPS switch** <br />
 Run `\Start_Switch.bat` to start the switch<br />
