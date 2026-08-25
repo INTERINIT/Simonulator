@@ -28,6 +28,7 @@ Completed:<br />
 
 Initially achieved:<br />
 
+* Phone functionality (mostly complete; now you can answer calls and stay on the line).
 * Status indicator lights on the device(The amber indicator light currently only reflects the power status of the virtual phone hardware and is not yet linked to the working status of the phone hardware, nor is it consistent with the real phone.)
 * PCMCIA Card Support
 * Serial port on the bottom of the device
@@ -37,6 +38,7 @@ Not yet realized:<br />
 * Emergency call (will report an error)
 * Physical buttons (power button and volume buttons)
 * Standby mode (memory retention not implemented)
+* Mail and Fax
 
 
 ## 📥How to use?
