@@ -6,7 +6,7 @@ An IBM Simon Emulator Based on MAME<br />
 [![LICENSE](https://img.shields.io/badge/LICENSE-GPL2.0-blue.svg?style=for-the-badge)](https://github.com/Inter1006/PenPointOS_Vbox/blob/main/LICENSE )
 
 Language  语言<br />
-[简体中文](https://www.freedos.org/)  |  ENGLISH<br />
+[简体中文]([https://www.freedos.org/](https://www.youtube.com/watch?v=dQw4w9WgXcQ))  |  ENGLISH<br />
 
 
 </div>
@@ -40,13 +40,46 @@ Not yet realized:<br />
 
 
 ## 📥How to use?
+**Download** <br />
 You can find the pre-compiled version at [Releases](https://github.com/INTERINIT/Simonulator/releases).<br />
+
+**Preparations before starting** <br />
+Before you begin, you will need a complete Simon dump. <br />
+The dump should consist of the following parts: <br />
+1.Dump Simon's 1MB FlashROM, named "SIMONFlash.bin" <br />
+2.Dump Simon's 128KB BIOS chip, named "simonbios.bin" <br />
+(The above two files should be placed in `\roms\ibmsimon`)<br />
+
+*For some reason, this project does not provide any dump copies, but you can follow This [Project](www.114.com).*
+
+**Use the virtual AMPS switch** <br />
+Run `\Start_Switch.bat` to start the switch<br />
+
+Common Commands:
+
+|Command      |function                |For example      |
+|-------------|------------------------|-----------------|
+|list         |List all online devices |                 |
+|ring A B     |Call B as A             |ring 1001 1002   |
+|hang A       |Set A to hang-up mode(equivalent to pressing End on side A to hang up).|hang 1001 |
+set A [Service Status] [signal strength] [Operator Name] |Modify the network information obtained by A|set 1001 Home1 6 helloworld
+|clear        |Clear screen            |                 |
+|quit         |Quit the switch         |                 |
+<br />
 
 **How to compile?** <br />
 Under Construction
 
 ## 🛠️Under Construction
 under construction
+
+## The Use of AI
+The following parts of this project use **Codex**: <br />
+1.Automatic capture and analysis of some logs <br />
+2.Partial reverse engineering of C:\Phone.exe <br />
+
+**All other code was written manually by real people,all tests were completed by me personally, and all code involving AI has been manually reviewed.**
+
 
 ## ❗Known problem
 Because the MAME emulator is relatively inefficient, the overall running speed of the emulation instance will decrease after the phone hardware is started.<br />
