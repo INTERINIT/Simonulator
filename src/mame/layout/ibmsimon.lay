@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!-- license:CC0-1.0 -->
+<mamelayout version="2">
+	<element name="case">
+		<rect><color red="0.055" green="0.055" blue="0.050" /></rect>
+	</element>
+	<element name="power" defstate="0">
+		<disk state="1"><color red="0.10" green="0.95" blue="0.20" /></disk>
+		<disk state="0"><color red="0.025" green="0.12" blue="0.035" /></disk>
+	</element>
+	<element name="phone" defstate="0">
+		<disk state="1"><color red="1.00" green="0.58" blue="0.06" /></disk>
+		<disk state="0"><color red="0.16" green="0.075" blue="0.015" /></disk>
+	</element>
+	<element name="backlight" defstate="0">
+		<disk state="1"><color red="0.72" green="0.88" blue="1.00" /></disk>
+		<disk state="0"><color red="0.055" green="0.075" blue="0.09" /></disk>
+	</element>
+	<element name="power_label"><text string="PWR"><color red="0.62" green="0.62" blue="0.58" /></text></element>
+	<element name="phone_label"><text string="PHONE"><color red="0.62" green="0.62" blue="0.58" /></text></element>
+	<element name="backlight_label"><text string="BL"><color red="0.62" green="0.62" blue="0.58" /></text></element>
+
+	<view name="Simon Front">
+		<element ref="case"><bounds x="0" y="0" width="220" height="684" /></element>
+		<element name="backlight_led" ref="backlight"><bounds x="101" y="11" width="11" height="11" /></element>
+		<element ref="backlight_label"><bounds x="115" y="9" width="14" height="14" /></element>
+		<element name="power_led" ref="power"><bounds x="139" y="11" width="11" height="11" /></element>
+		<element ref="power_label"><bounds x="153" y="9" width="20" height="14" /></element>
+		<element name="phone_led" ref="phone"><bounds x="176" y="11" width="11" height="11" /></element>
+		<element ref="phone_label"><bounds x="189" y="9" width="27" height="14" /></element>
+		<screen index="0"><bounds x="10" y="34" width="200" height="640" /></screen>
+	</view>
+</mamelayout>
+
