@@ -1,0 +1,31 @@
+# IBM Simon firmware dumps are required to run the emulator, but must not be
+# committed or redistributed with this project.
+firmware/
+roms/
+*.bin
+
+# MAME source/build trees and generated artifacts
+/mame/
+/build/
+*.exe
+*.dll
+*.pdb
+*.a
+*.lib
+*.obj
+
+# MAME runtime state and diagnostics
+cfg/
+nvram/
+snap/
+sta/
+diff/
+comments/
+*.log
+
+# Editor/OS files
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
