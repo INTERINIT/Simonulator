@@ -79,7 +79,7 @@ under construction
 The following parts of this project use **Codex**: <br />
 1.Automatic capture and analysis of some logs <br />
 2.Partial reverse engineering of C:\Phone.exe <br />
-3.Code refactoring work<br />
+3.Cleanup of the working directory<br />
 
 **All other code was written manually by real people,all tests were completed by me personally, and all code involving AI has been manually reviewed.**
 
