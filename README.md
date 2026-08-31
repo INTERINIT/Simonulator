@@ -70,7 +70,7 @@ set A [Service Status] [signal strength] [Operator Name] |Modify the network inf
 <br />
 
 **How to compile?** <br />
-Under Construction
+View [This](https://github.com/INTERINIT/Simonulator/blob/main/docs/BUILDING.md)
 
 ## 🛠️Under Construction
 under construction
