@@ -6,7 +6,7 @@ An IBM Simon Emulator Based on MAME<br />
 [![LICENSE](https://img.shields.io/badge/LICENSE-GPL2.0-blue.svg?style=for-the-badge)](https://github.com/Inter1006/PenPointOS_Vbox/blob/main/LICENSE )
 
 Language  语言<br />
-[简体中文](https://www.youtube.com/watch?v=dQw4w9WgXcQ)  |  ENGLISH<br />
+[简体中文](https://github.com/INTERINIT/Simonulator/blob/main/README_CN.md)  |  ENGLISH<br />
 
 
 </div>
@@ -66,7 +66,9 @@ Simonulator now supports physical buttons emulation.<br />
 **Use the virtual AMPS switch** <br />
 Run `\Start_Switch.bat` to start the switch<br />
 
-Common Commands:
+~Common Commands:~<br />
+*Common commands will no longer be required after October 3, 2026; the virtual switch now features a GUI.*
+
 
 |Command      |function                |For example      |
 |-------------|------------------------|-----------------|
