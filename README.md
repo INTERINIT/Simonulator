@@ -25,20 +25,21 @@ Completed:<br />
 * Analog touchscreen input
 * Backlighting system
 * RTC clock (correct clock speed)
+* Status indicator lights on the device
+* PCMCIA Card Support
+* The beeping sound
+* Physical buttons
+* Standby mode
 
 Initially achieved:<br />
 
 * Phone functionality (mostly complete; now you can answer calls and stay on the line).
-* Status indicator lights on the device(The amber indicator light currently only reflects the power status of the virtual phone hardware and is not yet linked to the working status of the phone hardware, nor is it consistent with the real phone.)
-* PCMCIA Card Support
 * Serial port on the bottom of the device
-* The beeping sound (speed and pitch are inconsistent with the actual device)
+* Mail and Fax
 
 Not yet realized:<br />
 * Emergency call (will report an error)
-* Physical buttons (power button and volume buttons)
-* Standby mode (memory retention not implemented)
-* Mail and Fax
+* ~You tell me~
 
 
 ## 📥How to use?
@@ -53,6 +54,14 @@ The dump should consist of the following parts: <br />
 (The above two files should be placed in `\roms\ibmsimon`)<br />
 
 *For some reason, this project does not provide any dump copies, but you can follow This [Project](https://github.com/INTERINIT/SimonDump).*
+
+**About physical buttons**<br />
+Simonulator now supports physical buttons emulation.<br />
+|Computer Keyboard|Simon actions|
+|-------------|------------------------|
+|F9|Rotate screen|
+|F10|Power off (enter standby mode)|
+|Page Up/Down|Sidebutton Up/Down|
 
 **Use the virtual AMPS switch** <br />
 Run `\Start_Switch.bat` to start the switch<br />
