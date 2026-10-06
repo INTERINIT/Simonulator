@@ -75,7 +75,7 @@ enum ControlId : int {
 
 enum class UnitState { Registered, Originating, Paging, Ringing, Connected, BusyTone, Data };
 enum class CallStage { Page, Assign, Alert, Ringing, Connected };
-enum class Service { None, Echo, Mail, Fax, Pager };
+enum class Service { None, Echo, Mail, Fax, Pager, Emergency };
 
 const char *state_name(UnitState state) {
     switch (state) {
@@ -417,6 +417,49 @@ private:
         refresh();
     }
 
+    void start_emergency_call(Client &source) {
+        if (source.state != UnitState::Registered) {
+            send_line(source, "B");
+            source.state = UnitState::BusyTone;
+            source.tone_sample = 0;
+            log("Emergency call rejected: mobile " + std::to_string(source.number) + " is already in use");
+            refresh();
+            return;
+        }
+
+        const int channel = allocate_channel();
+        if (!channel) {
+            // Even an emergency call still requires an available AMPS forward/
+            // reverse voice-channel pair.  Report genuine system congestion.
+            send_line(source, "I 83");
+            log("Emergency call failed: no free AMPS voice channel for " + std::to_string(source.number));
+            return;
+        }
+
+        const int sat = std::array<int,3>{5970,6000,6030}[channel % 3];
+        source.peer = 911;
+        source.state = UnitState::Connected;
+        source.service = Service::Emergency;
+        source.channel = channel;
+        source.sat = sat;
+        source.last_sat = Clock::now();
+
+        // A PSAP is a network endpoint, not another registered mobile.  Retain
+        // a connected call record so its voice channel cannot be allocated to
+        // another call, then complete the normal FVC assignment seen by Simon.
+        Call emergency;
+        emergency.caller = source.number;
+        emergency.channel = channel;
+        emergency.sat = sat;
+        emergency.stage = CallStage::Connected;
+        m_calls.push_back(std::move(emergency));
+        send_channel(source);
+        send_line(source, "C");
+        log("Emergency 911 call connected: mobile " + std::to_string(source.number) +
+            ", channel " + std::to_string(channel) + ", SAT " + std::to_string(sat));
+        refresh();
+    }
+
     void originate(Client &source, const std::string &digits) {
         int target = 0;
         try { target = std::stoi(digits); } catch (...) { }
@@ -427,7 +470,8 @@ private:
             // while retaining the complete digits in the operator log.
             return digits == suffix || (digits.size() > suffix.size() && digits.ends_with(suffix));
         };
-        if (dialled(kDataNumber)) start_service(source, Service::Echo, kDataNumber);
+        if (digits == "911") start_emergency_call(source);
+        else if (dialled(kDataNumber)) start_service(source, Service::Echo, kDataNumber);
         else if (dialled(kMailNumber)) start_service(source, Service::Mail, kMailNumber);
         else if (dialled(kFaxNumber)) start_service(source, Service::Fax, kFaxNumber);
         else if (dialled(kPagerNumber)) start_service(source, Service::Pager, kPagerNumber);
