@@ -73,6 +73,7 @@ inline std::string initialize(const std::filesystem::path &directory, Listener &
             id INTEGER PRIMARY KEY CHECK(id=1), address TEXT NOT NULL,
             port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535));
         INSERT OR IGNORE INTO listener VALUES(1,'127.0.0.1',5555);
+        CREATE TABLE IF NOT EXISTS preferences (name TEXT PRIMARY KEY, value TEXT NOT NULL);
         COMMIT;
     )sql";
     if (sqlite3_exec(database.db, schema, nullptr, nullptr, nullptr) != SQLITE_OK) return sqlite3_errmsg(database.db);
@@ -89,6 +90,22 @@ inline bool save_listener(const Listener &listener) {
     if (!query.s) return false;
     query.text(1, listener.address);
     sqlite3_bind_int(query.s, 2, listener.port);
+    return sqlite3_step(query.s) == SQLITE_DONE;
+}
+
+// An unset language follows Windows until the operator chooses one.
+inline bool chinese_interface(bool system_default) {
+    Database database;
+    Query query(database, "SELECT value FROM preferences WHERE name='language'");
+    if (!query.s || sqlite3_step(query.s) != SQLITE_ROW) return system_default;
+    return query.col(0) == "zh-CN";
+}
+
+inline bool save_language(bool chinese) {
+    Database database;
+    Query query(database, "INSERT OR REPLACE INTO preferences VALUES('language',?)");
+    if (!query.s) return false;
+    query.text(1, chinese ? "zh-CN" : "en");
     return sqlite3_step(query.s) == SQLITE_DONE;
 }
 

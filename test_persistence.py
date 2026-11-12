@@ -15,6 +15,7 @@ from test_transport import Handset
 OPERATOR, APPLY = 112, 113
 MAIL_NAME, MAIL_PASSWORD, REGISTER = 115, 116, 117
 BIND_PORT, SAVE_LISTENER = 119, 120
+LANGUAGE_CHINESE = 40002
 
 
 ui = ctypes.windll.user32
@@ -159,6 +160,11 @@ def regression(exe, folder):
         unit = None
         try:
             window = wait_for(lambda: window_for(process, "SimonAmpsSwitchWindow"))
+            if first:
+                ui.SendMessageW(window, 0x111, LANGUAGE_CHINESE, 0)
+            title = ctypes.create_unicode_buffer(80)
+            ui.SendMessageW(window, 0x000d, len(title), ctypes.addressof(title))
+            assert title.value == "Simon AMPS 实验交换机", title.value
             with closing(sqlite3.connect(data / "simon-postoffice.sqlite3")) as db:
                 counts = tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                                for table in ("users", "letters", "profiles"))

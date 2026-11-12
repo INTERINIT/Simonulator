@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <deque>
 #include <fstream>
+#include <format>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@
 #include "mail_worker.h"
 #include "ccmail_link.h"
 #include "ccmail_session.h"
+#include "switch_log.h"
 #include "fax_link.h"
 
 using Clock = std::chrono::steady_clock;
@@ -85,6 +87,10 @@ enum ControlId : int {
     IDC_CLEAR,
     IDC_MAIL_NAME, IDC_MAIL_PASSWORD, IDC_REGISTER,
     IDC_BIND_ADDRESS, IDC_BIND_PORT, IDC_SAVE_LISTENER,
+    IDC_FROM_LABEL, IDC_TO_LABEL, IDC_PAGE_TO_LABEL, IDC_DIGITS_LABEL, IDC_PROFILE_LABEL,
+    IDC_MAIL_NAME_LABEL, IDC_PASSWORD_LABEL, IDC_ADDRESS_LABEL, IDC_PORT_LABEL,
+    IDC_SIGNAL_LABEL, IDC_OPERATOR_LABEL,
+    IDM_ENGLISH = 40001, IDM_CHINESE,
 };
 
 enum class UnitState { RadioOff, Registered, Originating, Paging, Ringing, Connected, BusyTone, Data };
@@ -92,31 +98,39 @@ enum class CallStage { Page, Assign, Alert, Ringing, Connected };
 enum class Service { None, Echo, Mail, Pager, Emergency, Web };
 enum class WirelineState { OnHook, DialTone, Collecting, Calling, Ringing, Connected, Ended };
 
-const char *state_name(UnitState state) {
+struct UiLabel {
+    const wchar_t *english;
+    const wchar_t *chinese;
+};
+
+bool g_chinese = false;
+const wchar_t *display(UiLabel label) { return g_chinese ? label.chinese : label.english; }
+
+UiLabel state_name(UnitState state) {
     switch (state) {
-    case UnitState::RadioOff: return "RF off";
-    case UnitState::Registered: return "Registered";
-    case UnitState::Originating: return "Originating";
-    case UnitState::Paging: return "Paging";
-    case UnitState::Ringing: return "Ringing";
-    case UnitState::Connected: return "Connected";
-    case UnitState::BusyTone: return "Busy tone";
-    case UnitState::Data: return "Data";
+    case UnitState::RadioOff: return {L"RF off", L"射频已关闭"};
+    case UnitState::Registered: return {L"Registered", L"已入网"};
+    case UnitState::Originating: return {L"Originating", L"正在发起呼叫"};
+    case UnitState::Paging: return {L"Paging", L"正在寻呼"};
+    case UnitState::Ringing: return {L"Ringing", L"正在响铃"};
+    case UnitState::Connected: return {L"Connected", L"已接通"};
+    case UnitState::BusyTone: return {L"Busy tone", L"忙音"};
+    case UnitState::Data: return {L"Data", L"数据连接"};
     }
-    return "?";
+    return {L"?", L"?"};
 }
 
-const char *wireline_state_name(WirelineState state) {
+UiLabel wireline_state_name(WirelineState state) {
     switch (state) {
-    case WirelineState::OnHook: return "Wall jack on-hook";
-    case WirelineState::DialTone: return "Wall jack dial tone";
-    case WirelineState::Collecting: return "Wall jack dialling";
-    case WirelineState::Calling: return "Wall jack ringing";
-    case WirelineState::Ringing: return "Wall jack incoming";
-    case WirelineState::Connected: return "Wall jack connected";
-    case WirelineState::Ended: return "Wall jack ended/busy";
+    case WirelineState::OnHook: return {L"Wall jack on-hook", L"座机已挂机"};
+    case WirelineState::DialTone: return {L"Wall jack dial tone", L"座机拨号音"};
+    case WirelineState::Collecting: return {L"Wall jack dialling", L"座机正在拨号"};
+    case WirelineState::Calling: return {L"Wall jack ringing", L"座机正在回铃"};
+    case WirelineState::Ringing: return {L"Wall jack incoming", L"座机来电"};
+    case WirelineState::Connected: return {L"Wall jack connected", L"座机已接通"};
+    case WirelineState::Ended: return {L"Wall jack ended/busy", L"座机已结束／占线"};
     }
-    return "?";
+    return {L"?", L"?"};
 }
 
 std::wstring widen(const std::string &value) {
@@ -291,7 +305,7 @@ struct UnitSnapshot {
     int number = 0;
     int wireline_number = 0;
     bool wireline_present = false;
-    std::string state;
+    UiLabel state;
     int peer = 0;
     int channel = 0;
     int sat = 0;
@@ -353,18 +367,27 @@ private:
     std::uint64_t m_next_request = 1;
     postoffice::AccountWorker m_accounts;
 
-    void log(std::string text) {
+    void write_log(const std::string &english, const std::string &chinese) {
         SYSTEMTIME st{};
         GetLocalTime(&st);
         char prefix[32];
         std::snprintf(prefix, sizeof(prefix), "%02u:%02u:%02u.%03u  ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
         std::ofstream trace("amps-switch.log", std::ios::app | std::ios::binary);
-        trace << prefix << text << "\r\n";
+        trace << prefix << english << "\r\n";
         if (m_notify) {
-            auto *message = new std::wstring(widen(std::string(prefix) + text + "\r\n"));
+            auto *message = new SwitchLogMessage{
+                widen(prefix + english + "\r\n"), widen(prefix + chinese + "\r\n")};
             if (!PostMessageW(m_notify, WM_SWITCH_LOG, 0, reinterpret_cast<LPARAM>(message))) delete message;
         }
     }
+
+    template <typename... Args>
+    void log(std::string_view english, std::string_view chinese, const Args &...values) {
+        const auto args = std::make_format_args(values...);
+        write_log(std::vformat(english, args), std::vformat(chinese, args));
+    }
+
+    void log_protocol(const std::string &line) { write_log(line, line); }
 
     Client *find(int number) {
         auto it = m_clients.find(number);
@@ -455,7 +478,8 @@ private:
         client.channel = kControlChannel;
         client.sat = 6000;
         send_profile(client);
-        log("RF registered: " + std::to_string(client.number) + ", control channel " + std::to_string(kControlChannel));
+        log("RF registered: {}, control channel {}",
+            "射频模块已入网：{}，控制信道 {}", client.number, kControlChannel);
         refresh();
     }
 
@@ -469,7 +493,8 @@ private:
         client.channel = 0;
         client.sat = 0;
         if (client.service == Service::None && !wireline_active(client)) client.state = UnitState::RadioOff;
-        log("RF powered off/unregistered: " + std::to_string(client.number));
+        log("RF powered off/unregistered: {}",
+            "射频模块已关机并注销：{}", client.number);
         refresh();
     }
 
@@ -514,7 +539,8 @@ private:
             source.state = UnitState::BusyTone;
             if (source_wireline) source.wireline_state = WirelineState::Ended;
             source.tone_sample = 0;
-            log("Busy/unavailable destination: " + std::to_string(calling_number) + " -> " + std::to_string(target_number));
+            log("Busy/unavailable destination: {} -> {}",
+                "被叫忙或不可达：{} -> {}", calling_number, target_number);
             refresh();
             return;
         }
@@ -529,7 +555,8 @@ private:
                 source.wireline_state = WirelineState::Ended;
                 source.tone_sample = 0;
             }
-            log("No free AMPS voice channel for " + std::to_string(calling_number));
+            log("No free AMPS voice channel for {}",
+                "没有可供 {} 使用的 AMPS 话音信道", calling_number);
             return;
         }
         const int sat = needs_radio ? std::array<int, 3>{5970, 6000, 6030}[channel % 3] : 0;
@@ -552,8 +579,9 @@ private:
         call.calling_number = calling_number;
         call.called_number = target_number;
         m_calls.push_back(std::move(call));
-        log(std::string(source_wireline ? "Wall-jack origination: " : "RECC origination: ") +
-            std::to_string(calling_number) + " requests " + std::to_string(target_number));
+        log(source_wireline ? "Wall-jack origination: {} requests {}" : "RECC origination: {} requests {}",
+            source_wireline ? "固定电话发起呼叫：{} 拨打 {}" : "反向控制信道呼叫请求：{} 拨打 {}",
+            calling_number, target_number);
         refresh();
     }
 
@@ -570,7 +598,8 @@ private:
             client.wireline_digits.clear();
             client.wireline_dtmf = DtmfDetector{};
         }
-        log("Wall jack " + std::to_string(client.wireline_number) + (present ? " inserted" : " removed"));
+        log(present ? "Wall jack {} inserted" : "Wall jack {} removed",
+            present ? "固定电话 {} 已接入电话线" : "固定电话 {} 已拔出电话线", client.wireline_number);
         refresh();
     }
 
@@ -579,7 +608,8 @@ private:
         if (offhook) {
             if (!client.wireline_present) {
                 send_line(client, "M V B");
-                log("Wall-jack off-hook rejected: no adapter at " + std::to_string(client.wireline_number));
+                log("Wall-jack off-hook rejected: no adapter at {}",
+                    "固定电话摘机失败：{} 未连接电话线适配器", client.wireline_number);
                 return;
             }
             if (client.wireline_state == WirelineState::Ringing && client.state == UnitState::Ringing) {
@@ -593,8 +623,8 @@ private:
             if (client.service != Service::None ||
                 (client.state != UnitState::RadioOff && client.state != UnitState::Registered)) {
                 send_line(client, "M V B");
-                log("Wall-jack off-hook rejected: line " + std::to_string(client.wireline_number) +
-                    " shares busy handset " + std::to_string(client.number));
+                log("Wall-jack off-hook rejected: line {} shares busy handset {}",
+                    "固定电话摘机失败：线路 {} 共用的话机 {} 正忙", client.wireline_number, client.number);
                 return;
             }
             client.wireline_offhook = true;
@@ -602,7 +632,8 @@ private:
             client.wireline_digits.clear();
             client.wireline_dtmf = DtmfDetector{};
             client.tone_sample = 0;
-            log("Wall-jack off-hook: " + std::to_string(client.wireline_number) + "; waiting for in-band DTMF");
+            log("Wall-jack off-hook: {}; waiting for in-band DTMF",
+                "固定电话 {} 已摘机，等待带内 DTMF 拨号", client.wireline_number);
         } else {
             release(client.number, false);
             client.wireline_offhook = false;
@@ -610,7 +641,8 @@ private:
             client.wireline_digits.clear();
             client.wireline_dtmf = DtmfDetector{};
             client.state = client.rf_ready ? UnitState::Registered : UnitState::RadioOff;
-            log("Wall-jack on-hook: " + std::to_string(client.wireline_number));
+            log("Wall-jack on-hook: {}",
+                "固定电话 {} 已挂机", client.wireline_number);
         }
         refresh();
     }
@@ -643,7 +675,8 @@ private:
             source.wireline_digits.push_back(*digit);
             source.wireline_state = WirelineState::Collecting;
             source.wireline_digit_due = Clock::now() + 2s;
-            log("Wall-jack DTMF digit from " + std::to_string(source.wireline_number) + ": " + std::string(1, *digit));
+            log("Wall-jack DTMF digit from {}: {}",
+                "固定电话 {} 的 DTMF 拨号：{}", source.wireline_number, *digit);
         }
     }
 
@@ -696,7 +729,8 @@ private:
                 source.mail_authenticated = source.mail_message_mode = source.mail_native_mode = false;
                 source.mail_message.clear();
             }
-            log("2400 bit/s data call: " + std::to_string(source.number) + " -> " + std::to_string(number));
+            log("2400 bit/s data call: {} -> {}",
+                "2400 bit/s 数据呼叫：{} -> {}", source.number, number);
         } else if (service == Service::Pager) {
             source.state = UnitState::Connected;
             source.channel = allocate_channel();
@@ -705,7 +739,8 @@ private:
             send_line(source, "C");
             source.pager_target.clear();
             source.pager_message.clear();
-            log("Pager IVR answered " + std::to_string(source.number) + "; enter destination#, message# using DTMF");
+            log("Pager IVR answered {}; enter destination#, message# using DTMF",
+                "寻呼语音应答系统已接通 {}，请用 DTMF 输入目标号码和 #，再输入数字消息和 #", source.number);
         }
         refresh();
     }
@@ -716,7 +751,8 @@ private:
             send_line(source, "B");
             source.state = UnitState::BusyTone;
             source.tone_sample = 0;
-            log("Emergency call rejected: mobile " + std::to_string(source.number) + " is already in use");
+            log("Emergency call rejected: mobile {} is already in use",
+                "紧急呼叫被拒绝：移动电话 {} 正在通话", source.number);
             refresh();
             return;
         }
@@ -726,7 +762,8 @@ private:
             // Even an emergency call still requires an available AMPS forward/
             // reverse voice-channel pair.  Report genuine system congestion.
             send_line(source, "I 83");
-            log("Emergency call failed: no free AMPS voice channel for " + std::to_string(source.number));
+            log("Emergency call failed: no free AMPS voice channel for {}",
+                "紧急呼叫失败：没有可供 {} 使用的 AMPS 话音信道", source.number);
             return;
         }
 
@@ -750,14 +787,15 @@ private:
         m_calls.push_back(std::move(emergency));
         send_channel(source);
         send_line(source, "C");
-        log("Emergency 911 call connected: mobile " + std::to_string(source.number) +
-            ", channel " + std::to_string(channel) + ", SAT " + std::to_string(sat));
+        log("Emergency 911 call connected: mobile {}, channel {}, SAT {}",
+            "911 紧急呼叫已接通：移动电话 {}，信道 {}，SAT {}", source.number, channel, sat);
         refresh();
     }
 
     void originate(Client &source, const std::string &digits) {
         if (!source.rf_ready || wireline_active(source)) {
-            log("Cellular origination ignored while RF is off: " + std::to_string(source.number));
+            log("Cellular origination ignored while RF is off: {}",
+                "移动呼叫未发起：{} 的射频模块已关闭", source.number);
             return;
         }
         int target = 0;
@@ -821,7 +859,8 @@ private:
         // operator popup and provoke another host RF-status report per page.
         if (!client_wireline) send_channel(*client);
         std::erase_if(m_calls, [number](const Call &call) { return call.caller == number || call.called == number; });
-        log("Release/ST: " + std::to_string(public_number) + (public_peer ? " <-> " + std::to_string(public_peer) : ""));
+        log("Release/ST: {}{}",
+            "释放通话/ST：{}{}", public_number, public_peer ? " <-> " + std::to_string(public_peer) : "");
         refresh();
     }
 
@@ -851,14 +890,18 @@ private:
         }
         it->stage = CallStage::Connected;
         it->due = Clock::now() + (it->network_page ? 1200ms : 0ms);
-		if (it->network_page)
-			log("Pager IVR voice path connected to " + std::to_string(source.number) +
-				"; sending digits to the RF deck's silent DTMF path");
-        else
-            log(std::string(it->caller_wireline || it->called_wireline ? "Wall-jack conversation: " : "FVC conversation: ") +
-                std::to_string(it->calling_number ? it->calling_number : caller->number) + " <-> " +
-                std::to_string(it->called_number ? it->called_number : source.number) +
-                ", channel " + std::to_string(it->channel) + ", SAT " + std::to_string(it->sat));
+        if (it->network_page) {
+            log("Pager IVR voice path connected to {}; sending digits to the RF deck's silent DTMF path",
+                "寻呼语音通道已接通 {}，正通过射频模块的静音 DTMF 通道发送数字", source.number);
+        } else {
+            const bool wireline = it->caller_wireline || it->called_wireline;
+            log(wireline ? "Wall-jack conversation: {} <-> {}, channel {}, SAT {}"
+                         : "FVC conversation: {} <-> {}, channel {}, SAT {}",
+                wireline ? "固定电话通话：{} <-> {}，信道 {}，SAT {}"
+                         : "前向话音信道通话：{} <-> {}，信道 {}，SAT {}",
+                it->calling_number ? it->calling_number : caller->number,
+                it->called_number ? it->called_number : source.number, it->channel, it->sat);
+        }
         refresh();
     }
 
@@ -892,18 +935,21 @@ private:
     void deliver_page(int from, int to, const std::string &text) {
         Client *target = find(to);
         if (!target || !target->rf_ready || wireline_active(*target) || target->state != UnitState::Registered) {
-            log("Pager destination unavailable: " + std::to_string(to));
+            log("Pager destination unavailable: {}",
+                "寻呼目标不可达：{}", to);
             return;
         }
         std::string digits;
         std::copy_if(text.begin(), text.end(), std::back_inserter(digits), [](unsigned char ch) { return std::isdigit(ch); });
         if (digits.empty()) {
-            log("Pager message rejected: enter one or more content digits");
+            log("Pager message rejected: enter one or more content digits",
+                "寻呼消息被拒绝：内容至少需要一位数字");
             return;
         }
         const int channel = allocate_channel();
         if (!channel) {
-            log("Pager delivery failed: no free AMPS voice channel");
+            log("Pager delivery failed: no free AMPS voice channel",
+                "寻呼投递失败：没有空闲的 AMPS 话音信道");
             return;
         }
         const int sat = std::array<int,3>{5970,6000,6030}[channel % 3];
@@ -921,8 +967,11 @@ private:
         page.network_page = true;
         page.page_digits = "#" + digits + "#";
         m_calls.push_back(std::move(page));
-        log("Network pager request -> " + std::to_string(to) + ", content digits: " + digits +
-            (from ? " (submitted by " + std::to_string(from) + ")" : ""));
+        if (from)
+            log("Network pager request -> {}, content digits: {} (submitted by {})",
+                "网络寻呼请求 -> {}，数字内容：{}（提交方 {}）", to, digits, from);
+        else
+            log("Network pager request -> {}, content digits: {}", "网络寻呼请求 -> {}，数字内容：{}", to, digits);
         refresh();
     }
 
@@ -936,7 +985,8 @@ private:
         }
         if (collecting_target) {
             client.service_input = "message";
-            log("Pager IVR destination accepted: " + client.pager_target);
+            log("Pager IVR destination accepted: {}",
+                "寻呼语音应答系统已接受目标号码 {}", client.pager_target);
             return;
         }
         int target = 0;
@@ -953,7 +1003,8 @@ private:
             send_line(*peer, (peer->wireline_offhook ? "M V Y " : "Y ") + hex);
         const auto pcm = decode_hex(hex);
         if (const auto digit = source.dtmf.push(pcm)) {
-            log("In-band DTMF from " + std::to_string(source.number) + ": " + std::string(1, *digit));
+            log("In-band DTMF from {}: {}",
+                "来自 {} 的带内 DTMF：{}", source.number, *digit);
             if (Client *peer = find(source.peer))
                 send_line(*peer, "E DTMF " + std::to_string(source.number) + " " + std::string(1, *digit));
             if (source.service == Service::Pager) pager_digit(source, *digit);
@@ -1109,7 +1160,8 @@ private:
         }
         // HTML GET/POST forms may contain passwords/tokens. Never log URLs,
         // headers, or transport payloads for a web service request.
-        log("SimonWeber HTTP request from " + std::to_string(client.number) + ": " + std::to_string(request.size()) + " bytes");
+        log("SimonWeber HTTP request from {}: {} bytes",
+            "来自 {} 的 SimonWeber HTTP 请求：{} 字节", client.number, request.size());
     }
 
     void service_web() {
@@ -1123,7 +1175,8 @@ private:
                 client->web_response = std::move(completion.response);
                 client->web_position = 0;
                 client->web_due = Clock::now();
-                log("SimonWeber response to " + std::to_string(number) + ": " + std::to_string(client->web_response.size()) + " bytes");
+                log("SimonWeber response to {}: {} bytes",
+                    "发往 {} 的 SimonWeber 响应：{} 字节", number, client->web_response.size());
                 break;
             }
         }
@@ -1271,7 +1324,7 @@ private:
             return;
         }
         if (line.rfind("T ", 0) == 0) {
-            if (client.rf_ready) log("[" + std::to_string(client.number) + "] RF " + line);
+            if (client.rf_ready) log_protocol("[" + std::to_string(client.number) + "] RF " + line);
             return;
         }
         if (line.rfind("P ", 0) == 0) return;
@@ -1328,7 +1381,7 @@ private:
             refresh();
             return;
         }
-        log("[" + std::to_string(client.number) + "] " + line);
+        log_protocol("[" + std::to_string(client.number) + "] " + line);
     }
 
     void process_calls() {
@@ -1350,8 +1403,11 @@ private:
             Client *called = find(call.called);
             if ((!caller && !call.network_page) || !called) continue;
             if (call.stage == CallStage::Page) {
-                log(call.called_wireline ? "PSTN line seizure -> " + std::to_string(called->wireline_number)
-                    : "FOCC page order -> " + std::to_string(called->number) + "; RECC page response received");
+                if (call.called_wireline)
+                    log("PSTN line seizure -> {}", "已占用固定电话线路 -> {}", called->wireline_number);
+                else
+                    log("FOCC page order -> {}; RECC page response received",
+                        "前向控制信道已呼叫 {}，已收到反向控制信道应答", called->number);
                 call.stage = CallStage::Assign;
                 call.due = now + 180ms;
             } else if (call.stage == CallStage::Assign) {
@@ -1365,7 +1421,8 @@ private:
                     caller->sat = call.sat;
                     send_line(*caller, "D " + std::to_string(caller->sid) + " " + std::to_string(call.channel) + " " + std::to_string(call.sat));
                 }
-                if (call.channel) log("FVC assignment: channel " + std::to_string(call.channel) + ", SAT " + std::to_string(call.sat));
+                if (call.channel) log("FVC assignment: channel {}, SAT {}",
+                    "已分配前向话音信道：信道 {}，SAT {}", call.channel, call.sat);
                 call.stage = CallStage::Alert;
                 call.due = now + 80ms;
             } else if (call.stage == CallStage::Alert) {
@@ -1387,8 +1444,8 @@ private:
                     caller->tone_sample = 0;
                 }
                 call.stage = CallStage::Ringing;
-                log("Alert order: " + std::to_string(calling_number) + " -> " +
-                    std::to_string(call.called_wireline ? called->wireline_number : called->number));
+                log("Alert order: {} -> {}",
+                    "振铃指令：{} -> {}", calling_number, call.called_wireline ? called->wireline_number : called->number);
                 refresh();
             }
         }
@@ -1470,7 +1527,8 @@ private:
                 completed_pages.push_back(call.called);
         }
         for (int number : completed_pages) {
-            log("Pager digits accepted by Simon " + std::to_string(number));
+            log("Pager digits accepted by Simon {}",
+                "Simon {} 已接收寻呼数字", number);
             release(number, true);
         }
     }
@@ -1482,7 +1540,8 @@ private:
             if (!client->wireline_offhook && client->state == UnitState::Connected && client->service == Service::None && now - client->last_sat > 5s)
                 lost.push_back(number);
         for (int number : lost) {
-            log("SAT lost for " + std::to_string(number) + "; releasing voice channel");
+            log("SAT lost for {}; releasing voice channel",
+                "{} 的 SAT 监测音丢失，正在释放话音信道", number);
             release(number, true);
         }
     }
@@ -1518,13 +1577,15 @@ private:
                 if (Client *client = find_address(action.from, wireline)) {
                     if (!wireline) originate(*client, std::to_string(action.to));
                     else if (client->wireline_offhook) begin_call(*client, action.to, true);
-                    else log("Wall-jack Call requires the Simon handset to go off-hook first: " + std::to_string(action.from));
+                    else log("Wall-jack Call requires the Simon handset to go off-hook first: {}",
+                        "固定电话呼叫前，请先在 Simon {} 上摘机", action.from);
                 }
             }
             else if (action.type == ActionType::Connect) {
                 bool wireline = false;
                 if (Client *client = find_address(action.to, wireline)) {
-                    if (wireline) log("Answer wall-jack calls on the Simon handset; the GUI does not lift its receiver");
+                    if (wireline) log("Answer wall-jack calls on the Simon handset; the GUI does not lift its receiver",
+                        "请在 Simon 话机上摘机接听固定电话来电");
                     else answer(*client);
                 }
             }
@@ -1532,19 +1593,22 @@ private:
                 bool wireline = false;
                 if (Client *client = find_address(action.from, wireline)) {
                     if (wireline == wireline_active(*client)) release(client->number, true);
-                    else log("Hang ignored: the selected number is not the active bearer");
+                    else log("Hang ignored: the selected number is not the active bearer",
+                        "挂机未执行：所选号码没有承载当前通话");
                 }
             }
             else if (action.type == ActionType::Page) deliver_page(action.from, action.to, action.text);
             else if (action.type == ActionType::Profile) {
                 if (action.from < kFirstNumber || action.from > kLastNumber) {
-                    log("Select a mobile number in the range 1001-1999.");
+                    log("Select a mobile number in the range 1001-1999.",
+                        "请选择 1001 至 1999 之间的移动电话号码");
                     continue;
                 }
                 switch_store::Profile profile{action.registration, std::clamp(action.signal, 0, 6),
                     action.operator_name.empty() ? "Simon AMPS" : action.operator_name};
                 if (!switch_store::save_profile(action.from, profile)) {
-                    log("Cannot save profile for " + std::to_string(action.from));
+                    log("Cannot save profile for {}",
+                        "无法保存 {} 的网络配置", action.from);
                     continue;
                 }
                 if (Client *client = find(action.from)) {
@@ -1552,7 +1616,8 @@ private:
                     if (client->rf_ready) send_profile(*client);
                     refresh();
                 }
-                log("Profile saved for " + std::to_string(action.from));
+                log("Profile saved for {}",
+                    "已保存 {} 的网络配置", action.from);
             }
         }
     }
@@ -1562,7 +1627,7 @@ private:
         for (const auto &[number, client] : m_clients)
             next.push_back(UnitSnapshot{number, client->wireline_number, client->wireline_present,
                 wireline_active(*client) ? wireline_state_name(client->wireline_state) :
-                    client->state == UnitState::Data && !client->rf_ready ? "Wireline data / RF off" : state_name(client->state),
+                    client->state == UnitState::Data && !client->rf_ready ? UiLabel{L"Wireline data / RF off", L"座机数据连接／射频已关闭"} : state_name(client->state),
                 client->peer_address ? client->peer_address : client->peer, client->channel, client->sat, client->rf_ready ? client->registration : "OFF",
                 client->rf_ready ? client->signal : 0, client->rf_ready ? client->sid : 0,
                 client->rf_ready ? client->operator_name : ""});
@@ -1580,7 +1645,8 @@ private:
         closesocket(client->socket);
         m_web_gateway.forget(std::uint64_t(number));
         m_clients.erase(number);
-        log("Simon disconnected: " + std::to_string(number));
+        log("Simon disconnected: {}",
+            "Simon 已断开连接：{}", number);
         refresh();
     }
 
@@ -1596,14 +1662,16 @@ private:
             client->socket = socket;
             client->number = allocate_number();
             if (!client->number) {
-                log("Transport rejected: all mobile 1001-1999 / wall-jack 2001-2999 number pairs are in use");
+                log("Transport rejected: all mobile 1001-1999 / wall-jack 2001-2999 number pairs are in use",
+                    "连接被拒绝：所有移动号码（1001 至 1999）及对应固定号码（2001 至 2999）都已占用");
                 closesocket(socket);
                 continue;
             }
             client->wireline_number = client->number + kWirelineNumberOffset;
             const int number = client->number;
             if (!switch_store::load_profile(number, *client)) {
-                log("Cannot read network profile for " + std::to_string(number));
+                log("Cannot read network profile for {}",
+                    "无法读取 {} 的网络配置", number);
                 closesocket(socket);
                 continue;
             }
@@ -1611,8 +1679,8 @@ private:
             // V is local virtual NAM configuration, not an over-the-air
             // registration.  Wait for N before sending any D/S RF profile.
             send_line(*m_clients[number], "V " + std::to_string(number));
-            log("Simon transport attached; mobile " + std::to_string(number) + ", wall jack " +
-                std::to_string(m_clients[number]->wireline_number) + "; RF off, wall jack unplugged");
+            log("Simon transport attached; mobile {}, wall jack {}; RF off, wall jack unplugged",
+                "Simon 已连接：移动号码 {}，固定号码 {}，射频模块已关闭，电话线尚未接入", number, m_clients[number]->wireline_number);
             refresh();
         }
     }
@@ -1684,7 +1752,11 @@ private:
     void run() {
         { std::ofstream clear("amps-switch.log", std::ios::trunc | std::ios::binary); }
         WSADATA data{};
-        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) { log("WSAStartup failed"); m_running = false; return; }
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            log("WSAStartup failed", "Windows 套接字初始化失败（WSAStartup）");
+            m_running = false;
+            return;
+        }
         m_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -1692,7 +1764,8 @@ private:
         const std::string endpoint = m_endpoint.address + ":" + std::to_string(m_endpoint.port);
         if (inet_pton(AF_INET, m_endpoint.address.c_str(), &address.sin_addr) != 1 ||
             bind(m_listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == SOCKET_ERROR || listen(m_listener, 8) == SOCKET_ERROR) {
-            log("Cannot listen on " + endpoint + " (check address and port)");
+            log("Cannot listen on {} (check address and port)",
+                "无法监听 {}，请检查地址和端口", endpoint);
             closesocket(m_listener);
             m_listener = INVALID_SOCKET;
             WSACleanup();
@@ -1701,9 +1774,10 @@ private:
         }
         u_long nonblocking = 1;
         ioctlsocket(m_listener, FIONBIO, &nonblocking);
-        log("AMPS switch listening on " + endpoint);
-        log("Services: data " + std::to_string(kDataNumber) + ", mail " + std::to_string(kMailNumber) +
-            ", web " + std::to_string(kWebNumber) + ", pager " + std::to_string(kPagerNumber));
+        log("AMPS switch listening on {}",
+            "AMPS 交换机正在监听 {}", endpoint);
+        log("Services: data {}, mail {}, web {}, pager {}",
+            "服务号码：数据 {}，邮件 {}，网页 {}，寻呼 {}", kDataNumber, kMailNumber, kWebNumber, kPagerNumber);
         auto audio_due = Clock::now() + 20ms;
         while (m_running) {
             accept_clients();
@@ -1752,6 +1826,20 @@ HWND g_signal = nullptr;
 HWND g_operator = nullptr;
 std::unique_ptr<SwitchServer> g_server;
 switch_store::Listener g_listener;
+HFONT g_font = nullptr;
+constexpr UiLabel kTitle{L"Simon AMPS Laboratory Switch", L"Simon AMPS 实验交换机"};
+struct RegistrationOption { const char *code; const wchar_t *chinese; };
+constexpr RegistrationOption kRegistrations[] = {
+    {"HOME1", L"归属网 1"}, {"HOME2", L"归属网 2"}, {"HOME3", L"归属网 3"}, {"HOME4", L"归属网 4"},
+    {"ROAM", L"漫游"}, {"ALTROAM", L"备用漫游"}, {"OFFLINE", L"离线"}
+};
+
+std::wstring registration_label(const std::string &code) {
+    if (g_chinese)
+        for (auto &option : kRegistrations)
+            if (code == option.code) return option.chinese;
+    return widen(code);
+}
 
 HWND control(const wchar_t *kind, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id) {
     return CreateWindowExW(0, kind, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, g_window,
@@ -1771,10 +1859,24 @@ std::string utf8_text(HWND handle) {
     return narrow(value);
 }
 
-void append_log(const wchar_t *text) {
+// Keep the most recent events bilingual so changing the menu also updates
+// the visible history. The full English diagnostic trace stays on disk.
+std::deque<SwitchLogMessage> g_log_history;
+
+const std::wstring &log_text(const SwitchLogMessage &event) {
+    return g_chinese ? event.chinese : event.english;
+}
+
+void append_log(SwitchLogMessage event) {
+    if (g_log_history.size() == 512) {
+        SendMessageW(g_log, EM_SETSEL, 0, log_text(g_log_history.front()).size());
+        SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+        g_log_history.pop_front();
+    }
     const int length = GetWindowTextLengthW(g_log);
     SendMessageW(g_log, EM_SETSEL, length, length);
-    SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text));
+    SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(log_text(event).c_str()));
+    g_log_history.push_back(std::move(event));
 }
 
 void refresh_list() {
@@ -1784,9 +1886,10 @@ void refresh_list() {
     int row = 0;
     for (const auto &unit : units) {
         std::array<std::wstring, 11> values{
-            std::to_wstring(unit.number), std::to_wstring(unit.wireline_number), unit.wireline_present ? L"Inserted" : L"Unplugged",
-            widen(unit.state), unit.peer ? std::to_wstring(unit.peer) : L"-",
-            std::to_wstring(unit.channel), std::to_wstring(unit.sat), widen(unit.registration),
+            std::to_wstring(unit.number), std::to_wstring(unit.wireline_number),
+            unit.wireline_present ? display({L"Inserted", L"已插入"}) : display({L"Unplugged", L"未插入"}),
+            display(unit.state), unit.peer ? std::to_wstring(unit.peer) : L"-",
+            std::to_wstring(unit.channel), std::to_wstring(unit.sat), registration_label(unit.registration),
             std::to_wstring(unit.signal), std::to_wstring(unit.sid), widen(unit.operator_name)
         };
         LVITEMW item{};
@@ -1799,18 +1902,53 @@ void refresh_list() {
     }
 }
 
-void add_columns() {
-    const std::array<std::pair<const wchar_t *, int>, 11> columns{{
-        {L"Mobile",65}, {L"Wall Jack",75}, {L"Jack",75}, {L"State",145}, {L"Peer",75}, {L"Channel",70}, {L"SAT",60},
-        {L"Registration",90}, {L"RSSI",55}, {L"SID",55}, {L"Operator",130}
+void update_interface() {
+    SetWindowTextW(g_window, display(kTitle));
+    std::wstring history;
+    for (const auto &event : g_log_history) history += log_text(event);
+    SetWindowTextW(g_log, history.c_str());
+    SendMessageW(g_log, EM_SETSEL, history.size(), history.size());
+    SendMessageW(g_log, EM_SCROLLCARET, 0, 0);
+    CheckMenuRadioItem(GetSubMenu(GetMenu(g_window), 0), IDM_ENGLISH, IDM_CHINESE,
+                       g_chinese ? IDM_CHINESE : IDM_ENGLISH, MF_BYCOMMAND);
+    struct Caption { int id; UiLabel text; };
+    constexpr Caption captions[] = {
+        {IDC_FROM_LABEL, {L"Call from", L"主叫号码"}}, {IDC_TO_LABEL, {L"to", L"至"}},
+        {IDC_CALL, {L"Call", L"呼叫"}}, {IDC_CONNECT, {L"Answer", L"接听"}}, {IDC_HANG, {L"Hang", L"挂断"}},
+        {IDC_PAGE_TO_LABEL, {L"Page to", L"寻呼号码"}}, {IDC_DIGITS_LABEL, {L"Digits", L"数字"}},
+        {IDC_PAGE, {L"Send network page", L"发送网络寻呼"}}, {IDC_PROFILE_LABEL, {L"Profile", L"网络"}},
+        {IDC_APPLY, {L"Apply", L"应用"}}, {IDC_CLEAR, {L"Clear log", L"清空日志"}},
+        {IDC_SIGNAL_LABEL, {L"RSSI", L"信号"}}, {IDC_OPERATOR_LABEL, {L"Operator", L"运营商"}},
+        {IDC_MAIL_NAME_LABEL, {L"Mailbox name", L"邮箱账号"}}, {IDC_PASSWORD_LABEL, {L"Password", L"邮箱密码"}},
+        {IDC_ADDRESS_LABEL, {L"Listen address", L"监听地址"}}, {IDC_PORT_LABEL, {L"Port", L"端口"}},
+        {IDC_REGISTER, {L"Register mailbox", L"注册邮箱"}},
+        {IDC_SAVE_LISTENER, {L"Save listener for next start", L"保存监听设置（重启生效）"}}
+    };
+    for (auto &caption : captions) SetDlgItemTextW(g_window, caption.id, display(caption.text));
+
+    const auto selected = SendMessageW(g_registration, CB_GETCURSEL, 0, 0);
+    SendMessageW(g_registration, CB_RESETCONTENT, 0, 0);
+    for (auto &option : kRegistrations) {
+        auto name = registration_label(option.code);
+        SendMessageW(g_registration, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
+    }
+    SendMessageW(g_registration, CB_SETCURSEL, selected == CB_ERR ? 0 : selected, 0);
+
+    constexpr std::array<std::pair<UiLabel, int>, 11> columns{{
+        {{L"Mobile",L"手机号码"},70}, {{L"Wall Jack",L"座机号码"},75}, {{L"Jack",L"电话插孔"},75},
+        {{L"State",L"状态"},145}, {{L"Peer",L"对端号码"},75}, {{L"Channel",L"信道"},70}, {{L"SAT",L"SAT"},60},
+        {{L"Registration",L"入网状态"},90}, {{L"RSSI",L"RSSI"},55}, {{L"SID",L"SID"},55}, {{L"Operator",L"运营商"},115}
     }};
+    const bool create = Header_GetItemCount(ListView_GetHeader(g_units)) == 0;
     for (int i = 0; i < int(columns.size()); ++i) {
         LVCOLUMNW column{};
-        column.mask = LVCF_TEXT | LVCF_WIDTH;
-        column.pszText = const_cast<wchar_t *>(columns[i].first);
+        column.mask = LVCF_TEXT | (create ? LVCF_WIDTH : 0);
+        column.pszText = const_cast<wchar_t *>(display(columns[i].first));
         column.cx = columns[i].second;
-        ListView_InsertColumn(g_units, i, &column);
+        if (create) ListView_InsertColumn(g_units, i, &column);
+        else ListView_SetColumn(g_units, i, &column);
     }
+    refresh_list();
 }
 
 void layout(int width, int height) {
@@ -1830,19 +1968,25 @@ void layout(int width, int height) {
     MoveWindow(g_page_to, 70, controls_y + 32, 75, 24, TRUE);
     MoveWindow(g_page_digits_label, 153, controls_y + 35, 48, 20, TRUE);
     MoveWindow(g_page_text, 203, controls_y + 32, 142, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_PAGE), 350, controls_y + 32, 100, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_PAGE), 350, controls_y + 32, 145, 24, TRUE);
     MoveWindow(g_profile_label, 10, controls_y + 67, 45, 20, TRUE);
     MoveWindow(g_registration, 55, controls_y + 64, 90, 200, TRUE);
-    MoveWindow(g_signal, 150, controls_y + 64, 45, 24, TRUE);
-    MoveWindow(g_operator, 200, controls_y + 64, 145, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_APPLY), 350, controls_y + 64, 75, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_SIGNAL_LABEL), 154, controls_y + 67, 35, 20, TRUE);
+    MoveWindow(g_signal, 192, controls_y + 64, 40, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_OPERATOR_LABEL), 242, controls_y + 67, 58, 20, TRUE);
+    MoveWindow(g_operator, 302, controls_y + 64, 131, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_APPLY), 443, controls_y + 64, 75, 24, TRUE);
     MoveWindow(GetDlgItem(g_window, IDC_CLEAR), width - 90, controls_y + 64, 80, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window,IDC_MAIL_NAME),10,controls_y+96,135,24,TRUE);
-    MoveWindow(GetDlgItem(g_window,IDC_MAIL_PASSWORD),150,controls_y+96,135,24,TRUE);
-    MoveWindow(GetDlgItem(g_window,IDC_REGISTER),290,controls_y+96,135,24,TRUE);
-    MoveWindow(GetDlgItem(g_window,IDC_BIND_ADDRESS),10,controls_y+128,135,24,TRUE);
-    MoveWindow(GetDlgItem(g_window,IDC_BIND_PORT),150,controls_y+128,70,24,TRUE);
-    MoveWindow(GetDlgItem(g_window,IDC_SAVE_LISTENER),225,controls_y+128,200,24,TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_MAIL_NAME_LABEL), 10, controls_y + 99, 90, 20, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_MAIL_NAME), 104, controls_y + 96, 128, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_PASSWORD_LABEL), 242, controls_y + 99, 58, 20, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_MAIL_PASSWORD), 302, controls_y + 96, 131, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_REGISTER), 443, controls_y + 96, 135, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_ADDRESS_LABEL), 10, controls_y + 131, 90, 20, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_BIND_ADDRESS), 104, controls_y + 128, 128, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_PORT_LABEL), 242, controls_y + 131, 58, 20, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_BIND_PORT), 302, controls_y + 128, 75, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_SAVE_LISTENER), 387, controls_y + 128, 200, 24, TRUE);
     MoveWindow(g_log,margin,controls_y+160,width-margin*2,std::max(80,height-controls_y-170),TRUE);
 }
 
@@ -1852,46 +1996,59 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         g_window = window;
         g_units = control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, 0, 0, 0, 0, IDC_UNITS);
         ListView_SetExtendedListViewStyle(g_units, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
-        add_columns();
-        g_call_from_label = control(L"STATIC", L"Call from", 0, 0, 0, 0, 0, -1);
+        g_call_from_label = control(L"STATIC", L"", 0, 0, 0, 0, 0, IDC_FROM_LABEL);
         g_from = control(L"EDIT", L"1001", WS_BORDER | ES_NUMBER, 0, 0, 0, 0, IDC_FROM);
-        g_call_to_label = control(L"STATIC", L"to", 0, 0, 0, 0, 0, -1);
+        g_call_to_label = control(L"STATIC", L"", 0, 0, 0, 0, 0, IDC_TO_LABEL);
         g_to = control(L"EDIT", L"1002", WS_BORDER | ES_NUMBER, 0, 0, 0, 0, IDC_TO);
-        control(L"BUTTON", L"Call", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_CALL);
-        control(L"BUTTON", L"Answer", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_CONNECT);
-        control(L"BUTTON", L"Hang", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_HANG);
-        g_page_to_label = control(L"STATIC", L"Page to", 0, 0, 0, 0, 0, -1);
+        control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_CALL);
+        control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_CONNECT);
+        control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_HANG);
+        g_page_to_label = control(L"STATIC", L"", 0, 0, 0, 0, 0, IDC_PAGE_TO_LABEL);
         g_page_to = control(L"EDIT", L"1002", WS_BORDER | ES_NUMBER, 0, 0, 0, 0, IDC_PAGE_TO);
-        g_page_digits_label = control(L"STATIC", L"Digits", 0, 0, 0, 0, 0, -1);
+        g_page_digits_label = control(L"STATIC", L"", 0, 0, 0, 0, 0, IDC_DIGITS_LABEL);
         g_page_text = control(L"EDIT", L"123", WS_BORDER | ES_NUMBER, 0, 0, 0, 0, IDC_PAGE_TEXT);
-        control(L"BUTTON", L"Send network page", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_PAGE);
-        g_profile_label = control(L"STATIC", L"Profile", 0, 0, 0, 0, 0, -1);
+        control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_PAGE);
+        g_profile_label = control(L"STATIC", L"", 0, 0, 0, 0, 0, IDC_PROFILE_LABEL);
         g_registration = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST, 0, 0, 0, 0, IDC_REGISTRATION);
-        for (const wchar_t *item : {L"HOME1",L"HOME2",L"HOME3",L"HOME4",L"ROAM",L"ALTROAM",L"OFFLINE"})
-            SendMessageW(g_registration, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
-        SendMessageW(g_registration, CB_SETCURSEL, 0, 0);
         g_signal = control(L"EDIT", L"6", WS_BORDER | ES_NUMBER, 0, 0, 0, 0, IDC_SIGNAL);
         g_operator = control(L"EDIT", L"Simon AMPS", WS_BORDER, 0, 0, 0, 0, IDC_OPERATOR);
-        control(L"BUTTON", L"Apply", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_APPLY);
-        control(L"BUTTON", L"Clear log", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_CLEAR);
+        control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_APPLY);
+        control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_CLEAR);
         auto name=control(L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL,0,0,0,0,IDC_MAIL_NAME);
         auto password=control(L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL|ES_PASSWORD,0,0,0,0,IDC_MAIL_PASSWORD);
         SendMessageW(name,EM_SETLIMITTEXT,32,0); SendMessageW(password,EM_SETLIMITTEXT,64,0);
-        SendMessageW(name,0x1501,TRUE,reinterpret_cast<LPARAM>(L"Mailbox name"));
-        SendMessageW(password,0x1501,TRUE,reinterpret_cast<LPARAM>(L"Lab password"));
-        control(L"BUTTON",L"Register mailbox",BS_PUSHBUTTON,0,0,0,0,IDC_REGISTER);
+        control(L"BUTTON",L"",BS_PUSHBUTTON,0,0,0,0,IDC_REGISTER);
         control(L"EDIT",widen(g_listener.address).c_str(),WS_BORDER,0,0,0,0,IDC_BIND_ADDRESS);
         control(L"EDIT",std::to_wstring(g_listener.port).c_str(),WS_BORDER|ES_NUMBER,0,0,0,0,IDC_BIND_PORT);
-        control(L"BUTTON",L"Save listener for next start",BS_PUSHBUTTON,0,0,0,0,IDC_SAVE_LISTENER);
+        control(L"BUTTON",L"",BS_PUSHBUTTON,0,0,0,0,IDC_SAVE_LISTENER);
+        for (int label : {IDC_MAIL_NAME_LABEL, IDC_PASSWORD_LABEL, IDC_ADDRESS_LABEL, IDC_PORT_LABEL,
+                          IDC_SIGNAL_LABEL, IDC_OPERATOR_LABEL})
+            control(L"STATIC", L"", 0, 0, 0, 0, 0, label);
         g_log = control(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 0, 0, 0, 0, IDC_LOG);
-        HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        EnumChildWindows(window, [](HWND child, LPARAM value) -> BOOL { SendMessageW(child, WM_SETFONT, value, TRUE); return TRUE; }, reinterpret_cast<LPARAM>(font));
+        SendMessageW(g_log, EM_SETLIMITTEXT, 0x7ffffffe, 0);
+        NONCLIENTMETRICSW metrics{};
+        metrics.cbSize = sizeof(metrics);
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
+            g_font = CreateFontIndirectW(&metrics.lfMessageFont);
+        if (g_font) EnumChildWindows(window, [](HWND child, LPARAM font) -> BOOL {
+            SendMessageW(child, WM_SETFONT, font, TRUE);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(g_font));
+        update_interface();
         g_server = std::make_unique<SwitchServer>(window);
         g_server->start(g_listener);
         return 0;
     }
     case WM_SIZE: layout(LOWORD(lparam), HIWORD(lparam)); return 0;
     case WM_COMMAND:
+        if (LOWORD(wparam) == IDM_ENGLISH || LOWORD(wparam) == IDM_CHINESE) {
+            g_chinese = LOWORD(wparam) == IDM_CHINESE;
+            update_interface();
+            if (!switch_store::save_language(g_chinese))
+                MessageBoxW(window, display({L"Cannot save the language preference.", L"无法保存界面语言设置。"}),
+                            display(kTitle), MB_OK | MB_ICONWARNING);
+            return 0;
+        }
         if (HIWORD(wparam) == BN_CLICKED && g_server) {
             const int from = int_text(g_from), to = int_text(g_to);
             switch (LOWORD(wparam)) {
@@ -1900,11 +2057,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             case IDC_HANG: g_server->action(Action{ActionType::Hang, from}); break;
             case IDC_PAGE: g_server->action(Action{ActionType::Page, 0, int_text(g_page_to), 6, utf8_text(g_page_text)}); break;
             case IDC_APPLY: {
-                wchar_t registration[32]{};
-                GetWindowTextW(g_registration, registration, 32);
+                const auto selected = SendMessageW(g_registration, CB_GETCURSEL, 0, 0);
+                if (selected == CB_ERR) break;
                 Action action{ActionType::Profile, from};
                 action.signal = int_text(g_signal);
-                action.registration = narrow(registration);
+                action.registration = kRegistrations[selected].code;
                 action.operator_name = utf8_text(g_operator);
                 g_server->action(std::move(action));
                 break;
@@ -1912,40 +2069,51 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             case IDC_REGISTER: {
                 HWND password = GetDlgItem(window, IDC_MAIL_PASSWORD);
                 if (!g_server->register_mailbox(utf8_text(GetDlgItem(window, IDC_MAIL_NAME)), utf8_text(password)))
-                    append_log(L"Post office busy. Try registering the mailbox again shortly.\r\n");
+                    append_log({L"Post office busy. Try registering the mailbox again shortly.\r\n",
+                                L"邮局正忙，请稍后重新注册邮箱。\r\n"});
                 SetWindowTextW(password, L"");
                 break;
             }
-            case IDC_CLEAR: SetWindowTextW(g_log, L""); break;
+            case IDC_CLEAR:
+                g_log_history.clear();
+                SetWindowTextW(g_log, L"");
+                break;
             case IDC_SAVE_LISTENER: {
                 switch_store::Listener next{utf8_text(GetDlgItem(window, IDC_BIND_ADDRESS)), int_text(GetDlgItem(window, IDC_BIND_PORT))};
                 IN_ADDR address{};
                 if (inet_pton(AF_INET,next.address.c_str(),&address)!=1 || next.port<1 || next.port>65535) {
-                    MessageBoxW(window,L"Enter a local IPv4 address and a port from 1 to 65535.",L"Listener",MB_OK);
+                    MessageBoxW(window,display({L"Enter a local IPv4 address and a port from 1 to 65535.",
+                                                L"请输入本机 IPv4 地址和 1 至 65535 之间的端口号。"}),
+                                display({L"Listener", L"监听设置"}),MB_OK);
                     break;
                 }
                 const bool saved = switch_store::save_listener(next);
-                if (saved) append_log(L"Saved. Restart the switch to use this listener.\r\n");
-                else MessageBoxW(window,L"Cannot save listener settings.",L"Listener",MB_OK);
+                if (saved) append_log({L"Saved. Restart the switch to use this listener.\r\n",
+                                       L"监听设置已保存，重启交换机后生效。\r\n"});
+                else MessageBoxW(window,display({L"Cannot save listener settings.", L"无法保存监听设置。"}),
+                                 display({L"Listener", L"监听设置"}),MB_OK);
                 break;
             }
             }
         }
         return 0;
     case WM_SWITCH_LOG: {
-        std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring *>(lparam));
-        append_log(text->c_str());
+        std::unique_ptr<SwitchLogMessage> text(reinterpret_cast<SwitchLogMessage *>(lparam));
+        append_log(std::move(*text));
         return 0;
     }
     case WM_MAIL_REGISTERED:
         append_log(wparam
-            ? L"Mailbox created. Use 5551001 as the post office in Simon Mail.\r\n"
-            : L"Registration failed. Use a unique mailbox name and a 4-64 character non-space ASCII password. "
-              L"5551001 is reserved for the post office.\r\n");
+            ? SwitchLogMessage{L"Mailbox created. Use 5551001 as the post office in Simon Mail.\r\n",
+                       L"邮箱已创建。在 Simon Mail 中，邮局名称和拨号号码均填 5551001。\r\n"}
+            : SwitchLogMessage{L"Registration failed. Use a unique mailbox name and a 4-64 character non-space ASCII password. "
+                       L"5551001 is reserved for the post office.\r\n",
+                       L"注册失败。请使用尚未注册的邮箱名，密码由 4 至 64 个非空格 ASCII 字符组成。5551001 是邮局保留名称。\r\n"});
         return 0;
     case WM_SWITCH_REFRESH: refresh_list(); return 0;
     case WM_DESTROY:
         if (g_server) { g_server->stop(); g_server.reset(); }
+        if (g_font) DeleteObject(g_font);
         PostQuitMessage(0);
         return 0;
     }
@@ -1972,13 +2140,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     LocalFree(argv);
     if (port_override < 0 || port_override > 65535) return 2;
+    g_chinese = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_CHINESE;
     const auto error = switch_store::initialize(directory, g_listener);
     if (!error.empty()) {
-        MessageBoxW(nullptr,(L"Cannot initialize switch data in " + directory.wstring() + L"\n" + widen(error)).c_str(),
-            L"Simon AMPS Laboratory Switch",MB_OK|MB_ICONERROR);
+        const auto prefix = display({L"Cannot initialize switch data in ", L"无法初始化以下目录中的交换机数据："});
+        MessageBoxW(nullptr,(prefix + directory.wstring() + L"\n" + widen(error)).c_str(),
+            display(kTitle),MB_OK|MB_ICONERROR);
         return 1;
     }
     if (port_override) g_listener.port = port_override;
+    g_chinese = switch_store::chinese_interface(g_chinese);
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
     InitCommonControlsEx(&controls);
     WNDCLASSEXW klass{};
@@ -1990,8 +2161,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     klass.lpszClassName = L"SimonAmpsSwitchWindow";
     RegisterClassExW(&klass);
-    HWND window = CreateWindowExW(0, klass.lpszClassName, L"Simon AMPS Laboratory Switch", WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 900, 690, nullptr, nullptr, instance, nullptr);
+    HMENU menu = CreateMenu();
+    HMENU languages = CreatePopupMenu();
+    AppendMenuW(languages, MF_STRING, IDM_ENGLISH, L"English");
+    AppendMenuW(languages, MF_STRING, IDM_CHINESE, L"简体中文");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languages), L"语言 / &Language");
+    HWND window = CreateWindowExW(0, klass.lpszClassName, display(kTitle), WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 900, 690, nullptr, menu, instance, nullptr);
     if (!window) return 1;
     ShowWindow(window, show);
     UpdateWindow(window);
