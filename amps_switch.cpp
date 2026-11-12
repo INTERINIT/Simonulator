@@ -68,6 +68,7 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr UINT WM_SWITCH_LOG = WM_APP + 1;
 constexpr UINT WM_SWITCH_REFRESH = WM_APP + 2;
 constexpr UINT WM_MAIL_REGISTERED = WM_APP + 3;
+constexpr UINT WM_MAILBOXES_CHANGED = WM_APP + 4;
 
 enum ControlId : int {
     IDC_UNITS = 100,
@@ -90,7 +91,8 @@ enum ControlId : int {
     IDC_FROM_LABEL, IDC_TO_LABEL, IDC_PAGE_TO_LABEL, IDC_DIGITS_LABEL, IDC_PROFILE_LABEL,
     IDC_MAIL_NAME_LABEL, IDC_PASSWORD_LABEL, IDC_ADDRESS_LABEL, IDC_PORT_LABEL,
     IDC_SIGNAL_LABEL, IDC_OPERATOR_LABEL,
-    IDM_ENGLISH = 40001, IDM_CHINESE,
+    IDC_MAIL_LIST, IDC_MAIL_COUNT, IDC_MAIL_STATUS,
+    IDM_ENGLISH = 40001, IDM_CHINESE, IDM_MAILBOXES,
 };
 
 enum class UnitState { RadioOff, Registered, Originating, Paging, Ringing, Connected, BusyTone, Data };
@@ -338,7 +340,9 @@ public:
 
     bool register_mailbox(std::string name, std::string password) {
         return m_accounts.submit([window = m_notify, name = std::move(name), password = std::move(password)] {
-            PostMessageW(window, WM_MAIL_REGISTERED, postoffice::create(name, password), 0);
+            const bool created = postoffice::create(name, password);
+            PostMessageW(window, WM_MAIL_REGISTERED, created, 0);
+            if (created) PostMessageW(window, WM_MAILBOXES_CHANGED, 0, 0);
         });
     }
 
@@ -1132,7 +1136,7 @@ private:
             client.web_position = 0;
             client.web_due = Clock::now();
             if (frame.method == "GET") {
-                client.web_response = postoffice::registration(frame);
+                client.web_response = postoffice::registration(frame).response;
                 return;
             }
             const auto id = m_next_request++;
@@ -1141,7 +1145,10 @@ private:
                 Action reply{ActionType::WebReply};
                 reply.from = number;
                 reply.request = id;
-                reply.text = postoffice::registration(frame);
+                auto registration = postoffice::registration(frame);
+                reply.text = std::move(registration.response);
+                // The mailbox exists even if the registering phone has hung up.
+                if (registration.created) PostMessageW(m_notify, WM_MAILBOXES_CHANGED, 0, 0);
                 action(std::move(reply));
             })) {
                 client.web_request = 0;
@@ -1827,7 +1834,9 @@ HWND g_operator = nullptr;
 std::unique_ptr<SwitchServer> g_server;
 switch_store::Listener g_listener;
 HFONT g_font = nullptr;
+HWND g_mailboxes = nullptr;
 constexpr UiLabel kTitle{L"Simon AMPS Laboratory Switch", L"Simon AMPS 实验交换机"};
+constexpr UiLabel kMailboxesTitle{L"Mailbox Management", L"邮箱数据管理"};
 struct RegistrationOption { const char *code; const wchar_t *chinese; };
 constexpr RegistrationOption kRegistrations[] = {
     {"HOME1", L"归属网 1"}, {"HOME2", L"归属网 2"}, {"HOME3", L"归属网 3"}, {"HOME4", L"归属网 4"},
@@ -1841,8 +1850,8 @@ std::wstring registration_label(const std::string &code) {
     return widen(code);
 }
 
-HWND control(const wchar_t *kind, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id) {
-    return CreateWindowExW(0, kind, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, g_window,
+HWND control(const wchar_t *kind, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id, HWND parent = g_window) {
+    return CreateWindowExW(0, kind, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
 }
 
@@ -1902,6 +1911,139 @@ void refresh_list() {
     }
 }
 
+bool g_registration_pending = false;
+UiLabel g_mail_status{L"", L""};
+
+void set_mail_status(UiLabel status) {
+    g_mail_status = status;
+    if (g_mailboxes) SetDlgItemTextW(g_mailboxes, IDC_MAIL_STATUS, display(status));
+}
+
+void load_mailboxes() {
+    if (!g_mailboxes) return;
+    HWND list = GetDlgItem(g_mailboxes, IDC_MAIL_LIST);
+    const auto names = postoffice::mailbox_names();
+    if (!names) {
+        SetDlgItemTextW(g_mailboxes, IDC_MAIL_COUNT, display({L"Cannot read mailbox accounts.", L"无法读取邮箱账户。"}));
+        return;
+    }
+    // Restore selection by name when a newly registered account sorts before it.
+    wchar_t selected[33]{};
+    int index = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+    if (index >= 0) ListView_GetItemText(list, index, 0, selected, int(std::size(selected)));
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(list);
+    int row = 0;
+    for (auto &name : *names) {
+        std::wstring text = widen(name);
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = row;
+        item.pszText = text.data();
+        ListView_InsertItem(list, &item);
+        if (text == selected) ListView_SetItemState(list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ++row;
+    }
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(list, nullptr, TRUE);
+    std::wstring total = display({L"Accounts: ", L"账户总数："}) + std::to_wstring(names->size());
+    SetDlgItemTextW(g_mailboxes, IDC_MAIL_COUNT, total.c_str());
+}
+
+void update_mailbox_interface() {
+    if (!g_mailboxes) return;
+    SetWindowTextW(g_mailboxes, display(kMailboxesTitle));
+    SetDlgItemTextW(g_mailboxes, IDC_MAIL_NAME_LABEL, display({L"Mailbox name", L"邮箱账号"}));
+    SetDlgItemTextW(g_mailboxes, IDC_PASSWORD_LABEL, display({L"Password", L"邮箱密码"}));
+    SetDlgItemTextW(g_mailboxes, IDC_REGISTER, display({L"Register mailbox", L"注册邮箱"}));
+    SetDlgItemTextW(g_mailboxes, IDC_MAIL_STATUS, display(g_mail_status));
+    HWND list = GetDlgItem(g_mailboxes, IDC_MAIL_LIST);
+    LVCOLUMNW column{};
+    column.mask = LVCF_TEXT;
+    column.pszText = const_cast<wchar_t *>(display({L"Mailbox account", L"邮箱账户"}));
+    if (Header_GetItemCount(ListView_GetHeader(list)) == 0) ListView_InsertColumn(list, 0, &column);
+    else ListView_SetColumn(list, 0, &column);
+    load_mailboxes();
+}
+
+LRESULT CALLBACK mailbox_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+    case WM_CREATE: {
+        g_mailboxes = window;
+        HWND list = control(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, 0,0,0,0, IDC_MAIL_LIST, window);
+        ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+        for (auto id : {IDC_MAIL_COUNT, IDC_MAIL_NAME_LABEL, IDC_PASSWORD_LABEL, IDC_MAIL_STATUS})
+            control(L"STATIC", L"", 0, 0,0,0,0, id, window);
+        for (auto id : {IDC_MAIL_NAME, IDC_MAIL_PASSWORD}) {
+            const bool password = id == IDC_MAIL_PASSWORD;
+            HWND field = control(L"EDIT", L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | (password ? ES_PASSWORD : 0),
+                                 0,0,0,0, id, window);
+            SendMessageW(field, EM_SETLIMITTEXT, password ? 64 : 32, 0);
+        }
+        HWND button = control(L"BUTTON", L"", WS_TABSTOP | BS_DEFPUSHBUTTON, 0,0,0,0, IDC_REGISTER, window);
+        EnableWindow(button, !g_registration_pending);
+        if (g_font) EnumChildWindows(window, [](HWND child, LPARAM font) -> BOOL {
+            SendMessageW(child, WM_SETFONT, font, TRUE);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(g_font));
+        update_mailbox_interface();
+        return 0;
+    }
+    case WM_GETMINMAXINFO:
+        reinterpret_cast<MINMAXINFO *>(lparam)->ptMinTrackSize = {440, 330};
+        return 0;
+    case WM_SIZE: {
+        const int width = LOWORD(lparam), height = HIWORD(lparam);
+        const int list_height = std::max(40, height - 154);
+        HWND list = GetDlgItem(window, IDC_MAIL_LIST);
+        MoveWindow(list, 12, 12, width - 24, list_height, TRUE);
+        ListView_SetColumnWidth(list, 0, LVSCW_AUTOSIZE_USEHEADER);
+        const int top = list_height + 21;
+        MoveWindow(GetDlgItem(window, IDC_MAIL_COUNT), 12, top, width - 24, 20, TRUE);
+        for (int i = 0; i < 2; ++i) {
+            const int y = top + 25 + 29 * i;
+            MoveWindow(GetDlgItem(window, i ? IDC_PASSWORD_LABEL : IDC_MAIL_NAME_LABEL), 12, y + 3, 89, 20, TRUE);
+            MoveWindow(GetDlgItem(window, i ? IDC_MAIL_PASSWORD : IDC_MAIL_NAME), 105, y, width - 244, 24, TRUE);
+        }
+        MoveWindow(GetDlgItem(window, IDC_REGISTER), width - 128, top + 54, 116, 24, TRUE);
+        MoveWindow(GetDlgItem(window, IDC_MAIL_STATUS), 12, top + 85, width - 24, 42, TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wparam) == IDCANCEL) { DestroyWindow(window); return 0; }
+        if ((LOWORD(wparam) == IDC_REGISTER || LOWORD(wparam) == IDOK) && !g_registration_pending) {
+            HWND password = GetDlgItem(window, IDC_MAIL_PASSWORD);
+            g_registration_pending = g_server->register_mailbox(utf8_text(GetDlgItem(window, IDC_MAIL_NAME)), utf8_text(password));
+            if (g_registration_pending) {
+                EnableWindow(GetDlgItem(window, IDC_REGISTER), FALSE);
+                SetWindowTextW(password, L"");
+                set_mail_status({L"Registering mailbox…", L"正在注册邮箱…"});
+            } else {
+                set_mail_status({L"Post office busy. Please try again.", L"邮局正忙，请稍后再试。"});
+            }
+            return 0;
+        }
+        break;
+    case WM_DESTROY:
+        g_mailboxes = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+
+void open_mailboxes(HWND owner) {
+    if (!g_mailboxes) {
+        RECT rect;
+        GetWindowRect(owner, &rect);
+        CreateWindowExW(WS_EX_CONTROLPARENT, L"SimonMailboxesWindow", display(kMailboxesTitle), WS_OVERLAPPEDWINDOW,
+                        rect.left + 40, rect.top + 40, 560, 435, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    if (g_mailboxes) {
+        ShowWindow(g_mailboxes, IsIconic(g_mailboxes) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(g_mailboxes);
+    }
+}
+
 void update_interface() {
     SetWindowTextW(g_window, display(kTitle));
     std::wstring history;
@@ -1909,8 +2051,14 @@ void update_interface() {
     SetWindowTextW(g_log, history.c_str());
     SendMessageW(g_log, EM_SETSEL, history.size(), history.size());
     SendMessageW(g_log, EM_SCROLLCARET, 0, 0);
-    CheckMenuRadioItem(GetSubMenu(GetMenu(g_window), 0), IDM_ENGLISH, IDM_CHINESE,
+    HMENU menu = GetMenu(g_window);
+    HMENU tools = GetSubMenu(menu, 0);
+    ModifyMenuW(menu, 0, MF_BYPOSITION | MF_POPUP, reinterpret_cast<UINT_PTR>(tools), display({L"&Tools", L"工具(&T)"}));
+    ModifyMenuW(tools, IDM_MAILBOXES, MF_BYCOMMAND | MF_STRING, IDM_MAILBOXES, display(kMailboxesTitle));
+    CheckMenuRadioItem(GetSubMenu(menu, 1), IDM_ENGLISH, IDM_CHINESE,
                        g_chinese ? IDM_CHINESE : IDM_ENGLISH, MF_BYCOMMAND);
+    DrawMenuBar(g_window);
+    update_mailbox_interface();
     struct Caption { int id; UiLabel text; };
     constexpr Caption captions[] = {
         {IDC_FROM_LABEL, {L"Call from", L"主叫号码"}}, {IDC_TO_LABEL, {L"to", L"至"}},
@@ -1919,9 +2067,7 @@ void update_interface() {
         {IDC_PAGE, {L"Send network page", L"发送网络寻呼"}}, {IDC_PROFILE_LABEL, {L"Profile", L"网络"}},
         {IDC_APPLY, {L"Apply", L"应用"}}, {IDC_CLEAR, {L"Clear log", L"清空日志"}},
         {IDC_SIGNAL_LABEL, {L"RSSI", L"信号"}}, {IDC_OPERATOR_LABEL, {L"Operator", L"运营商"}},
-        {IDC_MAIL_NAME_LABEL, {L"Mailbox name", L"邮箱账号"}}, {IDC_PASSWORD_LABEL, {L"Password", L"邮箱密码"}},
         {IDC_ADDRESS_LABEL, {L"Listen address", L"监听地址"}}, {IDC_PORT_LABEL, {L"Port", L"端口"}},
-        {IDC_REGISTER, {L"Register mailbox", L"注册邮箱"}},
         {IDC_SAVE_LISTENER, {L"Save listener for next start", L"保存监听设置（重启生效）"}}
     };
     for (auto &caption : captions) SetDlgItemTextW(g_window, caption.id, display(caption.text));
@@ -1977,17 +2123,12 @@ void layout(int width, int height) {
     MoveWindow(g_operator, 302, controls_y + 64, 131, 24, TRUE);
     MoveWindow(GetDlgItem(g_window, IDC_APPLY), 443, controls_y + 64, 75, 24, TRUE);
     MoveWindow(GetDlgItem(g_window, IDC_CLEAR), width - 90, controls_y + 64, 80, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_MAIL_NAME_LABEL), 10, controls_y + 99, 90, 20, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_MAIL_NAME), 104, controls_y + 96, 128, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_PASSWORD_LABEL), 242, controls_y + 99, 58, 20, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_MAIL_PASSWORD), 302, controls_y + 96, 131, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_REGISTER), 443, controls_y + 96, 135, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_ADDRESS_LABEL), 10, controls_y + 131, 90, 20, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_BIND_ADDRESS), 104, controls_y + 128, 128, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_PORT_LABEL), 242, controls_y + 131, 58, 20, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_BIND_PORT), 302, controls_y + 128, 75, 24, TRUE);
-    MoveWindow(GetDlgItem(g_window, IDC_SAVE_LISTENER), 387, controls_y + 128, 200, 24, TRUE);
-    MoveWindow(g_log,margin,controls_y+160,width-margin*2,std::max(80,height-controls_y-170),TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_ADDRESS_LABEL), 10, controls_y + 99, 90, 20, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_BIND_ADDRESS), 104, controls_y + 96, 128, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_PORT_LABEL), 242, controls_y + 99, 58, 20, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_BIND_PORT), 302, controls_y + 96, 75, 24, TRUE);
+    MoveWindow(GetDlgItem(g_window, IDC_SAVE_LISTENER), 387, controls_y + 96, 200, 24, TRUE);
+    MoveWindow(g_log,margin,controls_y+128,width-margin*2,std::max(80,height-controls_y-138),TRUE);
 }
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -2014,15 +2155,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         g_operator = control(L"EDIT", L"Simon AMPS", WS_BORDER, 0, 0, 0, 0, IDC_OPERATOR);
         control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_APPLY);
         control(L"BUTTON", L"", BS_PUSHBUTTON, 0, 0, 0, 0, IDC_CLEAR);
-        auto name=control(L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL,0,0,0,0,IDC_MAIL_NAME);
-        auto password=control(L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL|ES_PASSWORD,0,0,0,0,IDC_MAIL_PASSWORD);
-        SendMessageW(name,EM_SETLIMITTEXT,32,0); SendMessageW(password,EM_SETLIMITTEXT,64,0);
-        control(L"BUTTON",L"",BS_PUSHBUTTON,0,0,0,0,IDC_REGISTER);
         control(L"EDIT",widen(g_listener.address).c_str(),WS_BORDER,0,0,0,0,IDC_BIND_ADDRESS);
         control(L"EDIT",std::to_wstring(g_listener.port).c_str(),WS_BORDER|ES_NUMBER,0,0,0,0,IDC_BIND_PORT);
         control(L"BUTTON",L"",BS_PUSHBUTTON,0,0,0,0,IDC_SAVE_LISTENER);
-        for (int label : {IDC_MAIL_NAME_LABEL, IDC_PASSWORD_LABEL, IDC_ADDRESS_LABEL, IDC_PORT_LABEL,
-                          IDC_SIGNAL_LABEL, IDC_OPERATOR_LABEL})
+        for (int label : {IDC_ADDRESS_LABEL, IDC_PORT_LABEL, IDC_SIGNAL_LABEL, IDC_OPERATOR_LABEL})
             control(L"STATIC", L"", 0, 0, 0, 0, 0, label);
         g_log = control(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 0, 0, 0, 0, IDC_LOG);
         SendMessageW(g_log, EM_SETLIMITTEXT, 0x7ffffffe, 0);
@@ -2041,6 +2177,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     }
     case WM_SIZE: layout(LOWORD(lparam), HIWORD(lparam)); return 0;
     case WM_COMMAND:
+        if (LOWORD(wparam) == IDM_MAILBOXES) { open_mailboxes(window); return 0; }
         if (LOWORD(wparam) == IDM_ENGLISH || LOWORD(wparam) == IDM_CHINESE) {
             g_chinese = LOWORD(wparam) == IDM_CHINESE;
             update_interface();
@@ -2064,14 +2201,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 action.registration = kRegistrations[selected].code;
                 action.operator_name = utf8_text(g_operator);
                 g_server->action(std::move(action));
-                break;
-            }
-            case IDC_REGISTER: {
-                HWND password = GetDlgItem(window, IDC_MAIL_PASSWORD);
-                if (!g_server->register_mailbox(utf8_text(GetDlgItem(window, IDC_MAIL_NAME)), utf8_text(password)))
-                    append_log({L"Post office busy. Try registering the mailbox again shortly.\r\n",
-                                L"邮局正忙，请稍后重新注册邮箱。\r\n"});
-                SetWindowTextW(password, L"");
                 break;
             }
             case IDC_CLEAR:
@@ -2102,14 +2231,19 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         append_log(std::move(*text));
         return 0;
     }
-    case WM_MAIL_REGISTERED:
-        append_log(wparam
-            ? SwitchLogMessage{L"Mailbox created. Use 5551001 as the post office in Simon Mail.\r\n",
-                       L"邮箱已创建。在 Simon Mail 中，邮局名称和拨号号码均填 5551001。\r\n"}
-            : SwitchLogMessage{L"Registration failed. Use a unique mailbox name and a 4-64 character non-space ASCII password. "
-                       L"5551001 is reserved for the post office.\r\n",
-                       L"注册失败。请使用尚未注册的邮箱名，密码由 4 至 64 个非空格 ASCII 字符组成。5551001 是邮局保留名称。\r\n"});
+    case WM_MAIL_REGISTERED: {
+        g_registration_pending = false;
+        if (g_mailboxes) EnableWindow(GetDlgItem(g_mailboxes, IDC_REGISTER), TRUE);
+        const UiLabel result = wparam
+            ? UiLabel{L"Mailbox created. Use 5551001 for the post office and dial-up number in Simon Mail.",
+                      L"邮箱已创建。在 Simon Mail 中，邮局名称和拨号号码均填 5551001。"}
+            : UiLabel{L"Registration failed. Choose a unique name other than 5551001 and a 4–64 character printable ASCII password without spaces.",
+                      L"注册失败。请使用未注册的邮箱名，避开保留名称 5551001。密码须为 4 至 64 个可打印的非空格 ASCII 字符。"};
+        set_mail_status(result);
+        append_log({std::wstring(result.english) + L"\r\n", std::wstring(result.chinese) + L"\r\n"});
         return 0;
+    }
+    case WM_MAILBOXES_CHANGED: load_mailboxes(); return 0;
     case WM_SWITCH_REFRESH: refresh_list(); return 0;
     case WM_DESTROY:
         if (g_server) { g_server->stop(); g_server.reset(); }
@@ -2161,7 +2295,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     klass.lpszClassName = L"SimonAmpsSwitchWindow";
     RegisterClassExW(&klass);
+    WNDCLASSEXW mail_class = klass;
+    mail_class.lpszClassName = L"SimonMailboxesWindow";
+    mail_class.lpfnWndProc = mailbox_proc;
+    RegisterClassExW(&mail_class);
     HMENU menu = CreateMenu();
+    HMENU tools = CreatePopupMenu();
+    AppendMenuW(tools, MF_STRING, IDM_MAILBOXES, display(kMailboxesTitle));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tools), display({L"&Tools", L"工具(&T)"}));
     HMENU languages = CreatePopupMenu();
     AppendMenuW(languages, MF_STRING, IDM_ENGLISH, L"English");
     AppendMenuW(languages, MF_STRING, IDM_CHINESE, L"简体中文");
@@ -2173,6 +2314,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     UpdateWindow(window);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (g_mailboxes && IsDialogMessageW(g_mailboxes, &message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }

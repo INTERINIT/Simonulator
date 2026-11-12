@@ -16,6 +16,7 @@ OPERATOR, APPLY = 112, 113
 MAIL_NAME, MAIL_PASSWORD, REGISTER = 115, 116, 117
 BIND_PORT, SAVE_LISTENER = 119, 120
 LANGUAGE_CHINESE = 40002
+MANAGE_MAILBOXES = 40003
 
 
 ui = ctypes.windll.user32
@@ -57,6 +58,17 @@ def click(window, control):
     assert ui.PostMessageW(window, 0x111, control, ui.GetDlgItem(window, control) or 0)
 
 
+def open_mailboxes(process, window):
+    click(window, MANAGE_MAILBOXES)
+    return wait_for(lambda: window_for(process, "SimonMailboxesWindow"))
+
+
+def mailbox_count(window):
+    listing = ui.FindWindowExW(window, None, "SysListView32", None)
+    assert listing
+    return ui.SendMessageW(listing, 0x1004, 0, 0)  # LVM_GETITEMCOUNT
+
+
 def scalar(database, sql, parameters=()):
     with closing(sqlite3.connect(database)) as db:
         return db.execute(sql, parameters).fetchone()[0]
@@ -91,11 +103,13 @@ def pending_accounts(exe, folder):
     units = []
     try:
         window = wait_for(lambda: window_for(process, "SimonAmpsSwitchWindow"))
-        edit(window, MAIL_NAME, "existing")
-        edit(window, MAIL_PASSWORD, "test-pass")
-        click(window, REGISTER)
+        mailboxes = open_mailboxes(process, window)
+        edit(mailboxes, MAIL_NAME, "existing")
+        edit(mailboxes, MAIL_PASSWORD, "test-pass")
+        click(mailboxes, REGISTER)
         database = data / "simon-postoffice.sqlite3"
         wait_for(lambda: scalar(database, "SELECT count(*) FROM users"))
+        wait_for(lambda: mailbox_count(mailboxes) == 1)
         for _ in range(26):
             unit = Handset(port, register=False)
             units.append(unit)
@@ -121,6 +135,8 @@ def pending_accounts(exe, folder):
         response = b"".join(bytes.fromhex(s[4:]) for s in reused.drain(1) if s.startswith("M X "))
         assert b"-ERR LOGIN REQUIRED" in response and b"+OK SIMON MAILBOX" not in response, response
         assert b"HTTP/1.0" not in response, response
+        # Successful web registrations update the already-open manager.
+        wait_for(lambda: mailbox_count(mailboxes) > 1)
 
         for i, unit in enumerate(units[1:]):
             registration(unit, f"batch{i}")
@@ -172,11 +188,14 @@ def regression(exe, folder):
                 assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
             unit = Handset(first_port if first else saved_port, register=False)
             if first:
-                for name in ("writer", "reader"):
-                    edit(window, MAIL_NAME, name)
-                    edit(window, MAIL_PASSWORD, "switch-test")
-                    click(window, REGISTER)
+                mailboxes = open_mailboxes(process, window)
+                assert mailbox_count(mailboxes) == 0
+                for count, name in enumerate(("writer", "reader"), start=1):
+                    edit(mailboxes, MAIL_NAME, name)
+                    edit(mailboxes, MAIL_PASSWORD, "switch-test")
+                    click(mailboxes, REGISTER)
                     wait_for(lambda: scalar(data / "simon-postoffice.sqlite3", "SELECT count(*) FROM users WHERE name=?", (name,)))
+                    wait_for(lambda: mailbox_count(mailboxes) == count)
                 edit(window, OPERATOR, "Test Operator")
                 click(window, APPLY)
                 edit(window, BIND_PORT, str(saved_port))

@@ -5,7 +5,9 @@
 #include <bcrypt.h>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <sstream>
+#include <vector>
 #include "switch_store.h"
 #include "weber_gateway.h"
 
@@ -28,6 +30,18 @@ inline bool exists(const std::string &name) {
     if (!lookup.s) return false;
     lookup.text(1, name);
     return sqlite3_step(lookup.s) == SQLITE_ROW;
+}
+
+inline std::optional<std::vector<std::string>> mailbox_names() {
+    Database db;
+    Query query(db, "SELECT name FROM users ORDER BY name COLLATE NOCASE");
+    if (!query.s) return std::nullopt;
+    std::vector<std::string> names;
+    int status;
+    while ((status = sqlite3_step(query.s)) == SQLITE_ROW)
+        names.push_back(query.col(0));
+    if (status != SQLITE_DONE) return std::nullopt;
+    return names;
 }
 
 inline bool derive(const std::string &password, Salt &salt, Key &verifier) {
@@ -145,15 +159,20 @@ inline std::string decode_field(const std::string &encoded) {
     return value;
 }
 
-inline std::string registration(const simon_weber::RequestFrame &frame) {
+struct RegistrationResult {
+    std::string response;
+    bool created = false;
+};
+
+inline RegistrationResult registration(const simon_weber::RequestFrame &frame) {
     if (frame.method == "GET") {
-        return simon_weber::response(200, "OK",
+        return {simon_weber::response(200, "OK",
             "<html><body><h1>Simon Post Office</h1><p>Name: letters, digits, - or _. Password: 4-64 "
             "printable non-space characters. Use a lab-only password. In Simon Mail settings use "
             "5551001 for the post office. That name is reserved; choose a different mailbox name.</p>"
             "<form action='http://simon.local/register' method='POST'>Name <input name='user'> "
             "Password <input type='password' name='password'><input type='submit' value='Register'>"
-            "</form></body></html>", "text/html");
+            "</form></body></html>", "text/html")};
     }
     std::map<std::string, std::string> fields;
     std::istringstream body(frame.body);
@@ -162,15 +181,15 @@ inline std::string registration(const simon_weber::RequestFrame &frame) {
         const auto separator = pair.find('=');
         if (separator == pair.npos ||
                 !fields.emplace(pair.substr(0, separator), decode_field(pair.substr(separator + 1))).second) {
-            return simon_weber::framing_error(400);
+            return {simon_weber::framing_error(400)};
         }
     }
     if (fields.size() == 2 && create(fields["user"], fields["password"])) {
-        return simon_weber::response(200, "OK", "<html><body>Account created.</body></html>", "text/html");
+        return {simon_weber::response(200, "OK", "<html><body>Account created.</body></html>", "text/html"), true};
     }
-    return simon_weber::response(400, "Registration failed",
+    return {simon_weber::response(400, "Registration failed",
         "<html><body>Registration failed. Check name and password or choose another name. "
-        "5551001 is reserved for the post office.</body></html>", "text/html");
+        "5551001 is reserved for the post office.</body></html>", "text/html")};
 }
 
 } // namespace postoffice
