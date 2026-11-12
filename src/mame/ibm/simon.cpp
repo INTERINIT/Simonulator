@@ -4368,10 +4368,11 @@ u32 ibmsimon_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	auto &pointer = machine().crosshair().get_crosshair(0);
 	pointer.set_mode(m_main_power ? CROSSHAIR_VISIBILITY_ON : CROSSHAIR_VISIBILITY_OFF);
 	pointer.set_visible(m_main_power);
+	const rgb_t unlit_glass(0xaf, 0xb0, 0x9e);
 	if (!m_main_power)
 	{
 		// Unlike a backlight timeout, SUSPEND removes LCD bias and blanks it.
-		bitmap.fill(rgb_t(0xa9, 0xad, 0x91), cliprect);
+		bitmap.fill(unlit_glass, cliprect);
 		return 0;
 	}
 
@@ -4379,7 +4380,7 @@ u32 ibmsimon_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	// backlight.  PWRON VP0 enables the panel supply while CFh's activity timer
 	// controls the visible backlight state emulated above.
 	const bool backlight = m_lcd_backlight;
-	const rgb_t clear = backlight ? rgb_t(0xf4, 0xf2, 0xdf) : rgb_t(0xa9, 0xad, 0x91);
+	const rgb_t clear = backlight ? rgb_t(0xe9, 0xf2, 0xf6) : unlit_glass;
 	const rgb_t midpoint = backlight ? rgb_t(0x18, 0x1b, 0x18) : rgb_t(0x43, 0x48, 0x3c);
 	// A multiplexed LCD applies voltage to unselected pixels too. As bias
 	// rises they darken after the selected pixels already look black. This
