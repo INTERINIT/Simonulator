@@ -23,7 +23,8 @@
 #include "bus/pccard/linflash.h"
 #include "bus/pccard/sram.h"
 #include "machine/genpc.h"
-#include "machine/keyboard.h"
+#include "machine/nvram.h"
+#include "simon_kbd.h"
 #include "machine/ram.h"
 #include "imagedev/bitbngr.h"
 #include "imagedev/cassette.h"
@@ -34,12 +35,41 @@
 #include "emupal.h"
 #include "render.h"
 #include "screen.h"
+#include "speaker.h"
+#include "util/multibyte.h"
 
 #include "ibmsimon.lh"
 
 #include <cstdio>
+#include <span>
+
+#if defined(__ANDROID__)
+extern "C" bool simon_android_battery_low();
+extern "C" int16_t simon_android_microphone_sample(bool active);
+extern "C" void simon_android_close_microphone();
+#elif defined(_WIN32)
+extern bool osd_windows_battery_low();
+#endif
 
 namespace {
+
+int hex_nibble(u8 character)
+{
+	if (character >= '0' && character <= '9')
+		return character - '0';
+	character = std::toupper(character);
+	return character >= 'A' && character <= 'F' ? character - 'A' + 10 : -1;
+}
+
+u16 hdlc_crc_byte(u16 crc, u8 octet)
+{
+	crc ^= octet;
+	for (int bit = 0; bit < 8; ++bit)
+		crc = (crc >> 1) ^ (BIT(crc, 0) ? 0x8408 : 0);
+	return crc;
+}
+
+enum : u8 { EXTERNAL_NONE, EXTERNAL_XT, EXTERNAL_RJ11 };
 
 class ibmsimon_state : public driver_device
 {
@@ -50,15 +80,19 @@ public:
 		m_mb(*this, "mb"),
 		m_screen(*this, "screen"),
 		m_mainram(*this, RAM_TAG),
+		m_clock_backup(*this, "clock_backup"),
 		m_bios(*this, "bios"),
 		m_flash(*this, "flash"),
 		m_pcmcia(*this, "pcmcia"),
+		m_keyboard(*this, "external_keyboard"),
 		m_pen_x(*this, "PENX"),
 		m_pen_y(*this, "PENY"),
 		m_pen_landscape_x(*this, "PENLX"),
 		m_pen_landscape_y(*this, "PENLY"),
 		m_pen_button(*this, "PEN"),
 		m_external_buttons(*this, "BUTTONS"),
+		m_external_connector(*this, "EXTERNAL_CONNECTOR"),
+		m_battery(*this, "MAIN_BATTERY"),
 		m_cellular_system(*this, "CELLULAR_SYSTEM"),
 		m_cellular_link(*this, "cellular"),
 		m_voice_input(*this, "voicein"),
@@ -74,25 +108,43 @@ public:
 	void ibmsimon(machine_config &config);
 	INPUT_CHANGED_MEMBER(power_button);
 	INPUT_CHANGED_MEMBER(orientation_button);
+	INPUT_CHANGED_MEMBER(keyboard_connection_changed);
 
 protected:
 	virtual void machine_start() override;
 	virtual void machine_reset() override;
+#ifdef __ANDROID__
+	virtual void device_stop() override
+	{
+		simon_android_close_microphone();
+		driver_device::device_stop();
+	}
+#endif
 
 private:
 	required_device<v30_device> m_maincpu;
 	required_device<pc_noppi_mb_device> m_mb;
 	required_device<screen_device> m_screen;
 	required_device<ram_device> m_mainram;
+	required_device<nvram_device> m_clock_backup;
+	void default_clock_backup(nvram_device &, void *data, size_t size);
 	required_region_ptr<u16> m_bios;
 	required_region_ptr<u8> m_flash;
 	required_device<pccard_slot_device> m_pcmcia;
+	required_device<simon_xt_keyboard_device> m_keyboard;
 	required_ioport m_pen_x;
 	required_ioport m_pen_y;
 	required_ioport m_pen_landscape_x;
 	required_ioport m_pen_landscape_y;
 	required_ioport m_pen_button;
 	required_ioport m_external_buttons;
+	required_ioport m_external_connector;
+	required_ioport m_battery;
+	bool battery_low() const;
+	bool m_host_battery_low = false;
+	u8 m_battery_nmi_delay = 15;
+	TIMER_CALLBACK_MEMBER(battery_sample);
+	void pmu_nmi(u8 cause);
 	required_ioport m_cellular_system;
 	required_device<bitbanger_device> m_cellular_link;
 	required_device<cassette_image_device> m_voice_input;
@@ -120,13 +172,18 @@ private:
 	u8 m_cga_mode_b = 0;
 	u8 m_cga_color = 0;
 	u8 m_ppi_b = 0;
+	u8 m_keyboard_latch = 0;
+	u8 m_keyboard_shift = 0;
+	bool m_keyboard_pending = false;
+	bool m_keyboard_clock = true;
+	bool m_keyboard_data = true;
 	bool m_pcmcia_cd1 = true;
 	bool m_pcmcia_cd2 = true;
 	bool m_pcmcia_cd1_target = true;
 	bool m_pcmcia_cd2_target = true;
 	bool m_pcmcia_contact_pending = false;
-	bool m_pcmcia_bvd1 = true;
-	bool m_pcmcia_bvd2 = true;
+	u8 m_pcmcia_bvd_pins = 0x60;
+	u8 m_pcmcia_bvd_irq = 0;
 	bool m_pcmcia_wp = false;
 	bool m_pcmcia_changed = false;
 	bool m_pcmcia_change_ack_pending = false;
@@ -134,17 +191,13 @@ private:
 	bool m_pcmcia_ever_present = false;
 	bool m_pcmcia_power_probe = false;
 	std::array<u8, 0x2000> m_pcmcia_attribute{};
-	u16 m_pcmcia_attribute_trace_count = 0;
-	u16 m_pcmcia_attribute_write_trace_count = 0;
-	u16 m_pcmcia_common_trace_count = 0;
-	u16 m_pcmcia_volume_trace_count = 0;
-	u16 m_pcmcia_map_trace_count = 0;
-	u16 m_pcmcia_status_trace_count = 0;
+	bool m_pcmcia_has_synthetic_cis = false;
 	emu_timer *m_pcmcia_irq_retrigger_timer = nullptr;
 	std::array<u8, 5> m_touch_packet{};
 	u8 m_touch_packet_size = 0;
 	u8 m_touch_packet_pos = 0;
 	u8 m_board_data_latch = 0xff;
+	u8 m_lcd_contrast = 32;
 	u8 m_touch_control = 0;
 	u16 m_last_pen_x = 0xffff;
 	u16 m_last_pen_y = 0xffff;
@@ -155,6 +208,8 @@ private:
 	u16 m_uart_divisor = 0;
 	bool m_uart_thre_irq = false;
 	bool m_uart_tx_empty = true;
+	u8 m_uart_shift = 0;
+	bool m_uart_rx_ready = false;
 	std::array<u8, 1024> m_uart_rx{};
 	u16 m_uart_rx_head = 0;
 	u16 m_uart_rx_tail = 0;
@@ -174,10 +229,38 @@ private:
 	bool m_modem_echo = true;
 	bool m_modem_verbose = true;
 	bool m_modem_online = false;
+	bool m_modem_carrier = false;
 	bool m_modem_dialing = false;
+	bool m_modem_rf_bearer = false;
 	bool m_modem_voice = false;
+	bool m_modem_line_offhook = false;
+	bool m_modem_jack_connected = false;
+	bool m_modem_ring_indicator = false;
+	u8 m_uart_msr_delta = 0;
+	u32 m_modem_line_number = 0;
+	std::array<u8, 256> m_modem_tone_digits{};
+	u16 m_modem_tone_size = 0;
+	u16 m_modem_tone_position = 0;
+	u16 m_modem_tone_gap = 0;
+	bool m_modem_tone_pending = false;
 	u8 m_modem_escape_count = 0;
+	attotime m_modem_last_tx = attotime::zero;
 	u8 m_modem_fax_class = 0;
+	enum : u8 { FX_IDLE, FX_TX_WAIT, FX_TX, FX_TX_END, FX_RX_WAIT, FX_RX, FX_SILENCE };
+	u8 m_fax_phase = FX_IDLE;
+	bool m_fax_dle = false, m_fax_credit = false;
+	u16 m_fax_ticks = 0;
+	std::array<u8, 64> m_fax_tx{};
+	u8 m_fax_count = 0;
+	bool m_fax_hdlc = false;
+	bool m_fax_rx_paused = false;
+	bool m_fax_final = true;
+	u16 m_fax_crc = 0xffff;
+	u32 m_fax_octets = 0;
+	void fax_buffer_byte(u8 data);
+	void fax_flush();
+	void fax_finish(bool failed);
+	void fax_link_event(std::string_view event);
 	std::array<s16, 205> m_modem_dtmf_window{};
 	u16 m_modem_dtmf_count = 0;
 	char m_modem_dtmf_candidate = 0;
@@ -246,6 +329,7 @@ private:
 	emu_timer *m_voice_timer = nullptr;
 	emu_timer *m_uart_tx_timer = nullptr;
 	emu_timer *m_uart_rx_irq_timer = nullptr;
+	emu_timer *m_modem_escape_timer = nullptr;
 	emu_timer *m_sio1_rx_irq_timer = nullptr;
 	emu_timer *m_sio1_tx_timer = nullptr;
 
@@ -267,8 +351,8 @@ private:
 	void vg230_index_w(u8 data);
 	void pcmcia_cd1_w(int state);
 	void pcmcia_cd2_w(int state);
-	void pcmcia_bvd1_w(int state);
-	void pcmcia_bvd2_w(int state);
+	template <u8 Pin> void pcmcia_bvd_w(int state);
+	bool pcmcia_irq_pending() const;
 	void pcmcia_wp_w(int state);
 	u8 pcmcia_status_r() const;
 	void pcmcia_update_irq();
@@ -276,7 +360,6 @@ private:
 	void pcmcia_attribute_init();
 	u8 pcmcia_attribute_r(u32 address) const;
 	void pcmcia_attribute_w(u32 address, u8 data);
-	IRQ_CALLBACK_MEMBER(irq_acknowledge);
 	u8 map_data_r(offs_t offset);
 	void map_data_w(offs_t offset, u8 data);
 	u8 cga_r(offs_t offset);
@@ -284,7 +367,12 @@ private:
 	u8 ppi_b_r();
 	void ppi_b_w(u8 data);
 	u8 ppi_c_r();
-	void dos_keyboard_put(u8 data);
+	u8 keyboard_r();
+	void keyboard_w(u8 data);
+	void keyboard_clock_w(int state);
+	void keyboard_data_w(int state);
+	void keyboard_postload();
+	u8 external_accessory_id() const;
 	u8 parallel_r(offs_t offset);
 	void parallel_w(offs_t offset, u8 data);
 	u8 touch_data_r();
@@ -304,10 +392,16 @@ private:
 	void sio1_rx_byte(u8 data);
 	void rf_status_response(u8 query, u16 value);
 	void rf_receive_byte(u8 data);
+	void rf_power_off();
 	void modem_receive_byte(u8 data);
+	void modem_send_data(u8 data);
 	void modem_execute_command();
 	void modem_voice_sample(u8 sample);
 	void modem_response(std::string_view text);
+	void modem_line_disconnect();
+	void modem_update_jack();
+	void modem_ring_w(bool state);
+	void voice_receive_packet(unsigned first, bool pager);
 	void modem_result(u8 numeric, std::string_view verbose);
 	void cellular_link_output(u8 data);
 	void cellular_link_text(std::string_view text);
@@ -323,17 +417,31 @@ private:
 	TIMER_CALLBACK_MEMBER(voice_tick);
 	TIMER_CALLBACK_MEMBER(uart_tx_done);
 	TIMER_CALLBACK_MEMBER(uart_rx_irq);
+	TIMER_CALLBACK_MEMBER(modem_escape_timeout);
 	TIMER_CALLBACK_MEMBER(sio1_rx_irq);
 	TIMER_CALLBACK_MEMBER(sio1_tx_done);
 	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
 };
 
+void ibmsimon_state::default_clock_backup(nvram_device &, void *data, size_t size)
+{
+	// A fresh virtual handset starts at ROM-DOS's 1980-01-01 midnight
+	// in Navigator's factory Eastern time zone. The retained record is UTC.
+	put_u32le(static_cast<u8 *>(data), 315550800);
+}
+
 void ibmsimon_state::machine_start()
 {
+	// Navigator loads and periodically updates this four-byte timestamp at
+	// EF00:0FD0, mapped by the VG230 to physical SRAM 0xF7FD0. The guest
+	// derives its RTC epoch from it before showing the reset-time notice.
+	m_clock_backup->set_base(&m_upper_ram[0x77fd0], sizeof(u32));
 	save_item(NAME(m_upper_ram));
 	save_item(NAME(m_video_ram));
 	save_item(NAME(m_vg230_regs));
 	save_item(NAME(m_rtc_subsecond_remaining));
+	save_item(NAME(m_battery_nmi_delay));
+	save_item(NAME(m_host_battery_low));
 	save_item(NAME(m_map_low));
 	save_item(NAME(m_map_high));
 	save_item(NAME(m_crtc_regs));
@@ -346,13 +454,18 @@ void ibmsimon_state::machine_start()
 	save_item(NAME(m_cga_mode_b));
 	save_item(NAME(m_cga_color));
 	save_item(NAME(m_ppi_b));
+	save_item(NAME(m_keyboard_latch));
+	save_item(NAME(m_keyboard_shift));
+	save_item(NAME(m_keyboard_pending));
+	save_item(NAME(m_keyboard_clock));
+	save_item(NAME(m_keyboard_data));
 	save_item(NAME(m_pcmcia_cd1));
 	save_item(NAME(m_pcmcia_cd2));
 	save_item(NAME(m_pcmcia_cd1_target));
 	save_item(NAME(m_pcmcia_cd2_target));
 	save_item(NAME(m_pcmcia_contact_pending));
-	save_item(NAME(m_pcmcia_bvd1));
-	save_item(NAME(m_pcmcia_bvd2));
+	save_item(NAME(m_pcmcia_bvd_pins));
+	save_item(NAME(m_pcmcia_bvd_irq));
 	save_item(NAME(m_pcmcia_wp));
 	save_item(NAME(m_pcmcia_changed));
 	save_item(NAME(m_pcmcia_change_ack_pending));
@@ -360,16 +473,11 @@ void ibmsimon_state::machine_start()
 	save_item(NAME(m_pcmcia_ever_present));
 	save_item(NAME(m_pcmcia_power_probe));
 	save_item(NAME(m_pcmcia_attribute));
-	save_item(NAME(m_pcmcia_attribute_trace_count));
-	save_item(NAME(m_pcmcia_attribute_write_trace_count));
-	save_item(NAME(m_pcmcia_common_trace_count));
-	save_item(NAME(m_pcmcia_volume_trace_count));
-	save_item(NAME(m_pcmcia_map_trace_count));
-	save_item(NAME(m_pcmcia_status_trace_count));
 	save_item(NAME(m_touch_packet));
 	save_item(NAME(m_touch_packet_size));
 	save_item(NAME(m_touch_packet_pos));
 	save_item(NAME(m_board_data_latch));
+	save_item(NAME(m_lcd_contrast));
 	save_item(NAME(m_touch_control));
 	save_item(NAME(m_last_pen_x));
 	save_item(NAME(m_last_pen_y));
@@ -379,6 +487,8 @@ void ibmsimon_state::machine_start()
 	save_item(NAME(m_uart_divisor));
 	save_item(NAME(m_uart_thre_irq));
 	save_item(NAME(m_uart_tx_empty));
+	save_item(NAME(m_uart_shift));
+	save_item(NAME(m_uart_rx_ready));
 	save_item(NAME(m_uart_rx));
 	save_item(NAME(m_uart_rx_head));
 	save_item(NAME(m_uart_rx_tail));
@@ -398,10 +508,34 @@ void ibmsimon_state::machine_start()
 	save_item(NAME(m_modem_echo));
 	save_item(NAME(m_modem_verbose));
 	save_item(NAME(m_modem_online));
+	save_item(NAME(m_modem_carrier));
 	save_item(NAME(m_modem_dialing));
+	save_item(NAME(m_modem_rf_bearer));
 	save_item(NAME(m_modem_voice));
+	save_item(NAME(m_modem_line_offhook));
+	save_item(NAME(m_modem_jack_connected));
+	save_item(NAME(m_modem_ring_indicator));
+	save_item(NAME(m_uart_msr_delta));
+	save_item(NAME(m_modem_line_number));
+	save_item(NAME(m_modem_tone_digits));
+	save_item(NAME(m_modem_tone_size));
+	save_item(NAME(m_modem_tone_position));
+	save_item(NAME(m_modem_tone_gap));
+	save_item(NAME(m_modem_tone_pending));
 	save_item(NAME(m_modem_escape_count));
+	save_item(NAME(m_modem_last_tx));
 	save_item(NAME(m_modem_fax_class));
+	save_item(NAME(m_fax_phase));
+	save_item(NAME(m_fax_hdlc));
+	save_item(NAME(m_fax_rx_paused));
+	save_item(NAME(m_fax_final));
+	save_item(NAME(m_fax_crc));
+	save_item(NAME(m_fax_octets));
+	save_item(NAME(m_fax_dle));
+	save_item(NAME(m_fax_credit));
+	save_item(NAME(m_fax_ticks));
+	save_item(NAME(m_fax_tx));
+	save_item(NAME(m_fax_count));
 	save_item(NAME(m_modem_dtmf_window));
 	save_item(NAME(m_modem_dtmf_count));
 	save_item(NAME(m_modem_dtmf_candidate));
@@ -469,8 +603,10 @@ void ibmsimon_state::machine_start()
 	// The VG230 RTC has its own 32.768 kHz supply/oscillator domain.  Its
 	// one-second carry must continue while the V30 and PIT are suspended.
 	m_rtc_timer = timer_alloc(FUNC(ibmsimon_state::rtc_tick), this);
+	timer_alloc(FUNC(ibmsimon_state::battery_sample), this)->adjust(attotime::from_seconds(1), 0, attotime::from_seconds(1));
 	m_rtc_timer->adjust(attotime::from_seconds(1), 0, attotime::from_seconds(1));
 	machine().save().register_postload(save_prepost_delegate(FUNC(ibmsimon_state::rtc_update_irq), this));
+	machine().save().register_postload(save_prepost_delegate(FUNC(ibmsimon_state::keyboard_postload), this));
 	m_touch_timer = timer_alloc(FUNC(ibmsimon_state::touch_tick), this);
 	m_touch_timer->adjust(attotime::from_hz(1000), 0, attotime::from_hz(1000));
 	m_pcmcia_irq_retrigger_timer = timer_alloc(FUNC(ibmsimon_state::pcmcia_irq_retrigger), this);
@@ -482,6 +618,7 @@ void ibmsimon_state::machine_start()
 	m_voice_timer->adjust(attotime::from_hz(8000), 0, attotime::from_hz(8000));
 	m_uart_tx_timer = timer_alloc(FUNC(ibmsimon_state::uart_tx_done), this);
 	m_uart_rx_irq_timer = timer_alloc(FUNC(ibmsimon_state::uart_rx_irq), this);
+	m_modem_escape_timer = timer_alloc(FUNC(ibmsimon_state::modem_escape_timeout), this);
 	m_sio1_rx_irq_timer = timer_alloc(FUNC(ibmsimon_state::sio1_rx_irq), this);
 	m_sio1_tx_timer = timer_alloc(FUNC(ibmsimon_state::sio1_tx_done), this);
 
@@ -493,6 +630,11 @@ void ibmsimon_state::machine_start()
 
 void ibmsimon_state::machine_reset()
 {
+	if (m_rf_ready_announced)
+		cellular_link_text("F 0\n");
+	modem_line_disconnect();
+	if (m_modem_jack_connected)
+		cellular_link_text("M J 0\n");
 	// Reset the CPU/controller, not the battery-backed RTC/CMOS domain.
 	// Cold construction already initializes 70h-BFh to zero with VALID clear.
 	std::fill(m_vg230_regs.begin(), m_vg230_regs.begin() + 0x70, 0);
@@ -524,6 +666,7 @@ void ibmsimon_state::machine_reset()
 	m_vg230_regs[0x38] = 0x28; // default top of conventional memory: 640 KiB
 	m_vg230_regs[0x40] = 0xf0; // ICU shadow reserved bits
 	m_vg230_regs[0xc1] = 0x01; // PMU registers start write-protected
+	m_battery_nmi_delay = 15;
 	m_vg230_regs[0xc6] = 0xfe; // documented PMU PWRON reset value
 	m_vg230_regs[0xcf] = 0x0a; // documented LCD inactivity default: 10 minutes
 	update_cpu_clock();
@@ -535,6 +678,16 @@ void ibmsimon_state::machine_reset()
 	m_cga_mode_b = 0;
 	m_cga_color = 0;
 	m_ppi_b = 0;
+	m_keyboard_latch = 0;
+	m_keyboard_shift = 0;
+	m_keyboard_pending = false;
+	m_keyboard_clock = true;
+	m_keyboard_data = true;
+	m_mb->m_pic8259->ir1_w(0);
+	m_keyboard->set_connected(m_external_connector->read() == EXTERNAL_XT);
+	m_keyboard->data_write(1);
+	m_keyboard->clock_write(0);
+	m_pcmcia_bvd_irq = 0;
 	m_pcmcia_changed = false;
 	m_pcmcia_change_ack_pending = false;
 	m_pcmcia_timeout = false;
@@ -544,12 +697,6 @@ void ibmsimon_state::machine_reset()
 	m_pcmcia_ever_present = !m_pcmcia_cd1 && !m_pcmcia_cd2;
 	m_pcmcia_power_probe = false;
 	pcmcia_attribute_init();
-	m_pcmcia_attribute_trace_count = 0;
-	m_pcmcia_attribute_write_trace_count = 0;
-	m_pcmcia_common_trace_count = 0;
-	m_pcmcia_volume_trace_count = 0;
-	m_pcmcia_map_trace_count = 0;
-	m_pcmcia_status_trace_count = 0;
 	m_pcmcia_irq_retrigger_timer->adjust(attotime::never);
 	m_mb->m_pit8253->write_gate2(0);
 	m_mb->pc_speaker_set_spkrdata(0);
@@ -560,6 +707,7 @@ void ibmsimon_state::machine_reset()
 	// active-low green system LED, so the lamp remains dark until firmware
 	// reaches the normal power-on sequence and explicitly asserts it.
 	m_board_data_latch = 0xff;
+	m_lcd_contrast = 32;
 	m_touch_control = 0;
 	m_last_pen_x = 0xffff;
 	m_last_pen_y = 0xffff;
@@ -570,6 +718,8 @@ void ibmsimon_state::machine_reset()
 	m_uart_divisor = 0;
 	m_uart_thre_irq = false;
 	m_uart_tx_empty = true;
+	m_uart_shift = 0;
+	m_uart_rx_ready = false;
 	m_uart_tx_timer->adjust(attotime::never);
 	m_uart_rx_irq_timer->adjust(attotime::never);
 	m_uart_rx.fill(0);
@@ -593,10 +743,27 @@ void ibmsimon_state::machine_reset()
 	m_modem_echo = true;
 	m_modem_verbose = true;
 	m_modem_online = false;
+	m_modem_carrier = false;
 	m_modem_dialing = false;
+	m_modem_rf_bearer = false;
 	m_modem_voice = false;
+	m_modem_line_offhook = false;
+	m_modem_jack_connected = false;
+	m_modem_ring_indicator = false;
+	m_uart_msr_delta = 0;
+	m_modem_line_number = 0;
+	m_modem_tone_digits.fill(0);
+	m_modem_tone_size = 0;
+	m_modem_tone_position = 0;
+	m_modem_tone_gap = 0;
+	m_modem_tone_pending = false;
 	m_modem_escape_count = 0;
+	m_modem_last_tx = machine().time();
+	m_modem_escape_timer->adjust(attotime::never);
 	m_modem_fax_class = 0;
+	m_fax_phase = FX_IDLE;
+	m_fax_count = m_fax_ticks = 0;
+	m_fax_dle = m_fax_credit = false;
 	m_modem_dtmf_window.fill(0);
 	m_modem_dtmf_count = 0;
 	m_modem_dtmf_candidate = 0;
@@ -734,35 +901,12 @@ u8 ibmsimon_state::window_r(offs_t offset)
 				const bool enhanced_attribute_windows = BIT(m_vg230_regs[0xe0], 7) && BIT(m_vg230_regs[0xe0], 2);
 				const bool common = m_mb->dma_memory_cycle() || enhanced_attribute_windows || BIT(m_vg230_regs[0x21], 5) || BIT(physical, 24);
 				const u32 card_address = common ? (physical & 0x00ffffff) : physical;
-				const u8 data = common ? m_pcmcia->read_memory_byte(card_address) : pcmcia_attribute_r(card_address);
-				if (common && card_address >= 0x001f00 && card_address < 0x002400 && m_pcmcia_volume_trace_count < 512)
-				{
-					logerror("%s Simon PC Card volume read host=%05X card=%06X data=%02X\n", machine().describe_context(), address, card_address, data);
-					++m_pcmcia_volume_trace_count;
-				}
-				u16 &trace_count = common
-					? m_pcmcia_common_trace_count
-					: m_pcmcia_attribute_trace_count;
-				if (trace_count < 2048)
-				{
-					if (common)
-						logerror("%s Simon PC Card common read host=%05X card=%06X data=%02X CTL=%02X\n", machine().describe_context(), address, card_address, data, m_vg230_regs[0x21]);
-					else
-						logerror("%s Simon PC Card attribute read %06X = %02X (CTL=%02X)\n", machine().describe_context(), card_address, data, m_vg230_regs[0x21]);
-					++trace_count;
-				}
-				return data;
+				return common ? m_pcmcia->read_memory_byte(card_address) : pcmcia_attribute_r(card_address);
 			}
 			return 0xff;
 		case 6: // PC Card A attribute memory in VG230 V3.1 window mode
 			if (!m_pcmcia_cd1 && !m_pcmcia_cd2 && BIT(m_vg230_regs[0xe0], 7) && BIT(m_vg230_regs[0xe0], 2) && !BIT(m_vg230_regs[0x20], 7) && !BIT(pcmcia_status_r(), 0))
-			{
-				const u8 data = pcmcia_attribute_r(physical);
-				if (m_pcmcia_attribute_trace_count < 2048)
-					logerror("%s Simon PC Card attribute read %06X = %02X (DTYP=6)\n", machine().describe_context(), physical, data);
-				++m_pcmcia_attribute_trace_count;
-				return data;
-			}
+				return pcmcia_attribute_r(physical);
 			return 0xff;
 		default:
 			return 0xff;
@@ -807,34 +951,14 @@ void ibmsimon_state::window_w(offs_t offset, u8 data)
 				const bool common = m_mb->dma_memory_cycle() || enhanced_attribute_windows || BIT(m_vg230_regs[0x21], 5) || BIT(physical, 24);
 				const u32 card_address = common ? (physical & 0x00ffffff) : physical;
 				if (common)
-				{
-					if (card_address >= 0x001f00 && card_address < 0x002400 && m_pcmcia_volume_trace_count < 512)
-					{
-						logerror("%s Simon PC Card volume write host=%05X card=%06X data=%02X\n", machine().describe_context(), address, card_address, data);
-						++m_pcmcia_volume_trace_count;
-					}
-					if (m_pcmcia_common_trace_count < 256)
-						osd_printf_info("Simon PC Card common write host=%05X card=%06X data=%02X CTL=%02X\n", address, card_address, data, m_vg230_regs[0x21]);
-					++m_pcmcia_common_trace_count;
 					m_pcmcia->write_memory_byte(card_address, data);
-				}
 				else
-				{
-					if (m_pcmcia_attribute_write_trace_count < 256)
-						logerror("%s Simon PC Card attribute write %06X = %02X (CTL=%02X)\n", machine().describe_context(), card_address, data, m_vg230_regs[0x21]);
-					++m_pcmcia_attribute_write_trace_count;
 					pcmcia_attribute_w(card_address, data);
-				}
 			}
 			break;
 		case 6: // PC Card A attribute memory in VG230 V3.1 window mode
 			if (!m_pcmcia_cd1 && !m_pcmcia_cd2 && BIT(m_vg230_regs[0xe0], 7) && BIT(m_vg230_regs[0xe0], 2) && !BIT(m_vg230_regs[0x20], 7) && !BIT(pcmcia_status_r(), 0))
-			{
-				if (m_pcmcia_attribute_write_trace_count < 256)
-					logerror("%s Simon PC Card attribute write %06X = %02X (DTYP=6)\n", machine().describe_context(), physical, data);
-				++m_pcmcia_attribute_write_trace_count;
 				pcmcia_attribute_w(physical, data);
-			}
 			break;
 		default:
 			break;
@@ -859,10 +983,13 @@ u8 ibmsimon_state::pcmcia_status_r() const
 	// established boot-time electrically-ready value until the first real card
 	// insertion; after that, hot removal is reported with PRESENT deasserted.
 	const bool present = physical_present || !m_pcmcia_ever_present;
-	u8 result = 0;
-	result |= 0x80; // SRAM cards are always ready
-	result |= (!present || m_pcmcia_bvd2) ? 0x40 : 0x00;
-	result |= (!present || m_pcmcia_bvd1) ? 0x20 : 0x00;
+	// Masked BVD inputs report the live pin. Enabled interrupts report the
+	// active-low latch until Socket Services acknowledges it (VG230 22h).
+	const u8 mask = m_vg230_regs[0x23];
+	const u8 battery_alerts = (~m_pcmcia_bvd_pins & mask) | (m_pcmcia_bvd_irq & ~mask);
+	u8 result = 0xe0; // Ready, both battery status pins high
+	if (physical_present)
+		result &= ~(battery_alerts & 0x60);
 	result |= present ? 0x00 : 0x10;
 	result |= m_pcmcia_changed ? 0x00 : 0x08;
 	result |= m_pcmcia_timeout ? 0x00 : 0x04;
@@ -870,8 +997,13 @@ u8 ibmsimon_state::pcmcia_status_r() const
 	// CRDOFF reports interface power, not card presence.  An empty socket does
 	// not by itself turn this bit on (VG230 2Dh explicitly ignores VPCRD while
 	// both sockets are empty).  Activity-timer power removal is not modelled.
-	result |= 0x00;
 	return result;
+}
+
+bool ibmsimon_state::pcmcia_irq_pending() const
+{
+	const u8 status = m_pcmcia_bvd_irq | (m_pcmcia_changed ? 0x08 : 0);
+	return (status & ~m_vg230_regs[0x23]) != 0;
 }
 
 void ibmsimon_state::pcmcia_update_irq()
@@ -879,7 +1011,7 @@ void ibmsimon_state::pcmcia_update_irq()
 	// VG230 23h bit 3 is active as a mask: zero enables the latched card-change
 	// interrupt.  Controller register 20h bits 5:4 route it to NMI/IRQ2/IRQ6/IRQ7.
 	// Keep IRQ6 wired-OR with the digitizer, as it is on the real board.
-	const bool pending = m_pcmcia_changed && !BIT(m_vg230_regs[0x23], 3);
+	const bool pending = pcmcia_irq_pending();
 	const u8 route = (m_vg230_regs[0x20] >> 4) & 0x03;
 	m_maincpu->set_input_line(INPUT_LINE_NMI, (BIT(m_vg230_regs[0x19], 0) || (pending && route == 0)) ? ASSERT_LINE : CLEAR_LINE);
 	rtc_update_irq(); // IRQ2 is shared with the independently running RTC.
@@ -925,7 +1057,7 @@ TIMER_CALLBACK_MEMBER(ibmsimon_state::pcmcia_irq_retrigger)
 		}
 		if (present != was_present)
 		{
-			m_pcmcia_status_trace_count = 0;
+			m_pcmcia_bvd_irq = present ? (~m_pcmcia_bvd_pins & ~m_vg230_regs[0x23] & 0x60) : 0;
 			if (present)
 			{
 				m_pcmcia_ever_present = true;
@@ -948,9 +1080,11 @@ void ibmsimon_state::pcmcia_attribute_init()
 
 	const bool sram_1800k = bool(m_pcmcia->subdevice("melcard_1800k"));
 	const bool sram_4m = bool(m_pcmcia->subdevice("melcard_4m"));
-	const bool sram_card = bool(m_pcmcia->subdevice("melcard_1m")) || sram_1800k || sram_4m;
+	const bool sram_16m = bool(m_pcmcia->subdevice("melcard_16m"));
+	const bool sram_card = bool(m_pcmcia->subdevice("melcard_1m")) || sram_1800k || sram_4m || sram_16m;
 	const bool linear_flash_card = bool(m_pcmcia->subdevice("linear16"));
-	if (!sram_card && !linear_flash_card)
+	m_pcmcia_has_synthetic_cis = sram_card || linear_flash_card;
+	if (!m_pcmcia_has_synthetic_cis)
 		return;
 
 	// A memory-only PC Card stores the CIS in attribute space on even byte
@@ -991,6 +1125,19 @@ void ibmsimon_state::pcmcia_attribute_init()
 		0x12, 0x04, 0x00, 0x00, 0x00, 0x00,
 		0xff
 	};
+	static constexpr u8 sram_16m_cis[] = {
+		// Eight 2 MiB units.  This is an experimental capacity rather than a
+		// card sold for Simon, but remains inside the VG230's 24-bit aperture.
+		0x01, 0x03, 0x63, 0x3e, 0xff,
+		0x1e, 0x07, 0x02, 0x00, 0x01, 0x01, 0x01, 0x01, 0xff,
+		0x15, 0x20, 0x04, 0x01,
+		'C', 'e', 'n', 't', 'e', 'n', 'n', 'i', 'a', 'l', 0x00,
+		'S', 'L', '1', '6', 'M', 0x00,
+		'1', '6', ' ', 'M', 'B', ' ', 'S', 'R', 'A', 'M', 0x00,
+		0x00, 0xff,
+		0x12, 0x04, 0x00, 0x00, 0x00, 0x00,
+		0xff
+	};
 	static constexpr u8 sram_1800k_cis[] = {
 		// DEVICE length encoding: fourteen 128 KiB units = 1,792 KiB,
 		// the capacity sold as the Simon 1.8 MB memory card.
@@ -1020,9 +1167,11 @@ void ibmsimon_state::pcmcia_attribute_init()
 		0xff                                                   // end of CIS chain
 	};
 
-	const u8 *const cis = linear_flash_card ? linear_flash_cis : (sram_4m ? sram_4m_cis : (sram_1800k ? sram_1800k_cis : sram_cis));
-	const size_t cis_size = linear_flash_card ? std::size(linear_flash_cis) : (sram_4m ? std::size(sram_4m_cis) : (sram_1800k ? std::size(sram_1800k_cis) : std::size(sram_cis)));
-	std::copy_n(cis, cis_size, m_pcmcia_attribute.begin());
+	std::span<const u8> cis = sram_cis;
+	if (linear_flash_card) cis = linear_flash_cis;
+	else if (sram_16m) cis = sram_16m_cis;
+	else if (sram_4m) cis = sram_4m_cis;
+	else if (sram_1800k) cis = sram_1800k_cis;
 
 	// An unformatted SRAM card has no secondary common-memory CIS yet.  Do not
 	// advertise a dangling long link: Card Services treats an invalid linked
@@ -1036,19 +1185,15 @@ void ibmsimon_state::pcmcia_attribute_init()
 		(m_pcmcia->read_memory_byte(6) == 'I') &&
 		(m_pcmcia->read_memory_byte(8) == 'S');
 	if (!cardtrick_chain)
-	{
-		// Both HLE templates place LONGLINK_C immediately before END.
-		m_pcmcia_attribute[cis_size - 7] = 0xff;
-		std::fill(m_pcmcia_attribute.begin() + cis_size - 6, m_pcmcia_attribute.begin() + cis_size, 0xff);
-	}
+		cis = cis.first(cis.size() - 7); // The prefilled FF terminates the unlinked CIS.
+	std::copy(cis.begin(), cis.end(), m_pcmcia_attribute.begin());
 }
 
 u8 ibmsimon_state::pcmcia_attribute_r(u32 address) const
 {
 	// I/O cards such as ATA Flash provide their own CIS and configuration
 	// registers through the generic PC Card device.
-	const bool hle_memory_card = bool(m_pcmcia->subdevice("melcard_1m")) || bool(m_pcmcia->subdevice("melcard_1800k")) || bool(m_pcmcia->subdevice("melcard_4m")) || bool(m_pcmcia->subdevice("linear16"));
-	if (!hle_memory_card)
+	if (!m_pcmcia_has_synthetic_cis)
 		return m_pcmcia->read_reg_byte(address);
 
 	// The 2 KiB 28C16 attribute EEPROM is selected on even byte addresses.
@@ -1064,8 +1209,7 @@ u8 ibmsimon_state::pcmcia_attribute_r(u32 address) const
 
 void ibmsimon_state::pcmcia_attribute_w(u32 address, u8 data)
 {
-	const bool hle_memory_card = bool(m_pcmcia->subdevice("melcard_1m")) || bool(m_pcmcia->subdevice("melcard_1800k")) || bool(m_pcmcia->subdevice("melcard_4m")) || bool(m_pcmcia->subdevice("linear16"));
-	if (!hle_memory_card)
+	if (!m_pcmcia_has_synthetic_cis)
 	{
 		m_pcmcia->write_reg_byte(address, data);
 		return;
@@ -1074,14 +1218,6 @@ void ibmsimon_state::pcmcia_attribute_w(u32 address, u8 data)
 	// Keep the factory CIS protected.  CardWare issues generic JEDEC probe
 	// commands while identifying memory technology; treating those commands as
 	// ordinary EEPROM byte writes destroys tuple zero before enumeration ends.
-}
-
-IRQ_CALLBACK_MEMBER(ibmsimon_state::irq_acknowledge)
-{
-	const int vector = m_mb->m_pic8259->acknowledge();
-	if (m_pcmcia_changed)
-		logerror("Simon interrupt acknowledge vector=%02X while PC Card change is pending\n", vector);
-	return vector;
 }
 
 void ibmsimon_state::pcmcia_cd1_w(int state)
@@ -1112,14 +1248,19 @@ void ibmsimon_state::pcmcia_cd2_w(int state)
 	m_pcmcia_cd2 = m_pcmcia_cd2_target = bool(state);
 }
 
-void ibmsimon_state::pcmcia_bvd1_w(int state)
+template <u8 Pin>
+void ibmsimon_state::pcmcia_bvd_w(int state)
 {
-	m_pcmcia_bvd1 = bool(state);
-}
-
-void ibmsimon_state::pcmcia_bvd2_w(int state)
-{
-	m_pcmcia_bvd2 = bool(state);
+	const bool falling = !state && (m_pcmcia_bvd_pins & Pin);
+	if (state)
+		m_pcmcia_bvd_pins |= Pin;
+	else
+		m_pcmcia_bvd_pins &= ~Pin;
+	if (falling && !m_pcmcia_cd1 && !m_pcmcia_cd2 && !(m_vg230_regs[0x23] & Pin) && !BIT(m_vg230_regs[0x21], 6))
+	{
+		m_pcmcia_bvd_irq |= Pin;
+		pcmcia_update_irq();
+	}
 }
 
 void ibmsimon_state::pcmcia_wp_w(int state)
@@ -1188,7 +1329,7 @@ void ibmsimon_state::rtc_data_w(u8 index, u8 data)
 void ibmsimon_state::rtc_update_irq()
 {
 	const bool rtc_pending = (m_vg230_regs[0x7a] & m_vg230_regs[0x79] & 0x03) != 0;
-	const bool card_pending = m_pcmcia_changed && !BIT(m_vg230_regs[0x23], 3) &&
+	const bool card_pending = pcmcia_irq_pending() &&
 		((m_vg230_regs[0x20] >> 4) & 0x03) == 1;
 	m_mb->m_pic8259->ir2_w(rtc_pending || card_pending);
 }
@@ -1251,6 +1392,12 @@ u8 ibmsimon_state::vg230_data_r()
 			result = 0xfc;
 		else
 			result = m_vg230_regs[m_vg230_index];
+		if (m_vg230_index == 0x33)
+		{
+			// ID0/ID1 are physical GPIO inputs, not firmware RAM.  See
+			// external_accessory_id() for the keyboard adapter's ID wiring.
+			result = (result & ~u8(0x03)) | (external_accessory_id() & 3);
+		}
 		// F000:CB25 is the generic two-socket "select operation socket" helper.
 		// Simon only wires socket 0, and the helper has no both-empty exit: it
 		// alternates reads at CB37/CB41 until one socket identifies itself.  A
@@ -1268,19 +1415,15 @@ u8 ibmsimon_state::vg230_data_r()
 			result &= ~u8(0x10);
 			m_pcmcia_power_probe = false;
 		}
-		if ((m_vg230_index == 0x22 || m_vg230_index == 0x28) && m_pcmcia_status_trace_count < 256)
-		{
-			logerror("VG230 PC Card status pc=%05X slot=%u value=%02X external_present=%u CD1=%u CD2=%u\n",
-				m_maincpu->pc(),
-				(m_vg230_index == 0x28) ? 1 : 0, result, (!m_pcmcia_cd1 && !m_pcmcia_cd2) ? 1 : 0,
-				m_pcmcia_cd1 ? 1 : 0, m_pcmcia_cd2 ? 1 : 0);
-			++m_pcmcia_status_trace_count;
-		}
 	}
 	// A read unlocks PMU writes after reset/resume.  Keep the exposed lock bit
 	// faithful while allowing the following firmware write to proceed.
-	if (m_vg230_index == 0xc1 && !machine().side_effects_disabled())
-		m_vg230_regs[0xc1] &= ~u8(0x01);
+	if (m_vg230_index == 0xc1)
+	{
+		result = (result & ~u8(0x02)) | (battery_low() ? 0x02 : 0);
+		if (!machine().side_effects_disabled())
+			m_vg230_regs[0xc1] &= ~u8(0x01);
+	}
 	if (m_vg230_index == 0xc0 && !machine().side_effects_disabled())
 		m_vg230_regs[0xc0] &= ~u8(0x80); // RESUME is read-to-clear
 	if (m_vg230_index == 0xc4 && !machine().side_effects_disabled())
@@ -1306,6 +1449,7 @@ void ibmsimon_state::vg230_data_w(u8 data)
 	// acknowledges those two latched conditions.
 	if (m_vg230_index == 0x22)
 	{
+		m_pcmcia_bvd_irq &= ~data;
 		if ((BIT(data, 3) && m_pcmcia_changed) || (BIT(data, 2) && m_pcmcia_timeout))
 			logerror("Simon PC Card status acknowledged value=%02X status-before=%02X\n", data, pcmcia_status_r());
 		if (BIT(data, 3))
@@ -1339,6 +1483,8 @@ void ibmsimon_state::vg230_data_w(u8 data)
 		// timer and peripheral context.  Stop the CPU only at its explicit
 		// SUSPEND command, never at the host-key edge.
 		m_vg230_regs[0xc0] = (m_vg230_regs[0xc0] & 0xfc) | (data & 3);
+		if (!BIT(m_vg230_regs[0xc6 + (data & 3)], 7))
+			rf_power_off();
 		if ((data & 3) == 3)
 		{
 			m_main_power = false;
@@ -1356,7 +1502,24 @@ void ibmsimon_state::vg230_data_w(u8 data)
 		logerror("VG230 PC Card register %02X: %02X -> %02X\n", m_vg230_index, m_vg230_regs[m_vg230_index], data);
 	if (m_vg230_index >= 0xe0 && m_vg230_index <= 0xe2 && m_vg230_regs[m_vg230_index] != data)
 		logerror("VG230 enhancement register %02X: %02X -> %02X\n", m_vg230_index, m_vg230_regs[m_vg230_index], data);
+	if (m_vg230_index == 0x08 && ((m_vg230_regs[0x08] ^ data) & 0x0c))
+		m_keyboard_shift = 0; // discard a partial frame when pin functions change
+	// BIOS F000:87C4 clocks GPIO2 once for lower contrast. F000:87E2
+	// clocks it 63 times for one step higher on the same 64-position bias
+	// counter. F000:8763 resets the bias supply with GPIO2 held high;
+	// boot and resume then restore the saved level relative to midpoint.
+	if (m_vg230_index == 0x33 && !BIT(m_vg230_regs[0x33], 2) && BIT(data, 2))
+		m_lcd_contrast = (m_lcd_contrast - 1) & 63;
+	if (m_vg230_index == 0xc6 && !BIT(m_vg230_regs[0xc6], 0) && BIT(data, 0) && BIT(m_vg230_regs[0x33], 2))
+		m_lcd_contrast = 32;
 	m_vg230_regs[m_vg230_index] = data;
+	// Simon BIOS INT15/A004 and A005 set/clear VP7 in all four PMU power
+	// tables to supply/cut the RF deck.  RJ11 switchover uses A005 without
+	// transmitting 8Ch, so serial commands alone cannot model its power.
+	// Only the active state's table drives the pin.  Raising it supplies the
+	// deck but does not register it: the native 7Fh command is still required.
+	if (m_vg230_index == 0xc6 + (m_vg230_regs[0xc0] & 3) && !BIT(data, 7))
+		rf_power_off();
 	if (m_vg230_index == 0x01)
 		update_cpu_clock();
 	if (m_vg230_index == 0x20 || m_vg230_index == 0x23)
@@ -1389,14 +1552,6 @@ void ibmsimon_state::map_data_w(offs_t offset, u8 data)
 	if (offset)
 	{
 		m_map_high[page] = data;
-		const unsigned type = (data >> 4) & 0x07;
-		if (type >= 4 && m_pcmcia_map_trace_count < 512)
-		{
-			const u32 card_base = (u32(data & 0x0f) << 22) | (u32(m_map_low[page]) << 14);
-			logerror("VG230 PC Card map page=%02X host=%05X DTYP=%u card=%07X high=%02X low=%02X E1=%02X CTL0=%02X\n",
-				page, page << 14, type, card_base, data, m_map_low[page], m_vg230_regs[0xe0], m_vg230_regs[0x21]);
-			++m_pcmcia_map_trace_count;
-		}
 	}
 	else
 		m_map_low[page] = data;
@@ -1466,39 +1621,104 @@ u8 ibmsimon_state::ppi_b_r()
 	return m_ppi_b;
 }
 
-void ibmsimon_state::dos_keyboard_put(u8 data)
+u8 ibmsimon_state::keyboard_r()
 {
-	if (!m_main_power)
-		return;
-	// Simon has no built-in PC keyboard, but its ROM-DOS console consumes the
-	// standard BIOS keyboard ring buffer.  Expose the host keyboard only while
-	// the LCD is in text mode so Navigator remains exclusively pen-driven.
-	if (BIT(m_cga_mode, 1))
+	// VG230 PPIA is an independent scan-code latch, NOT matrix return 0Ah.
+	// In external-controller mode the internal port is disconnected.
+	return (m_vg230_regs[0x08] & 0x0c) == 0x0c ? 0xff : m_keyboard_latch;
+}
+
+void ibmsimon_state::keyboard_w(u8 data)
+{
+	// Only matrix-scanner firmware may supply translated scans through PPIA.
+	// Simon selects the serial XT interface, where 60h is read-only.
+	if (!BIT(m_vg230_regs[0x08], 3) && !BIT(m_ppi_b, 7))
+	{
+		m_keyboard_latch = data;
+		m_keyboard_pending = true;
+		m_keyboard->data_write(0);
+		m_mb->m_pic8259->ir1_w(1);
+	}
+}
+
+void ibmsimon_state::keyboard_clock_w(int state)
+{
+	const bool falling = m_keyboard_clock && !state;
+	m_keyboard_clock = bool(state);
+	if (!falling || m_external_connector->read() != EXTERNAL_XT ||
+		(m_vg230_regs[0x08] & 0x0c) != 0x08 || !BIT(m_ppi_b, 6) ||
+		BIT(m_ppi_b, 7) || m_keyboard_pending)
 		return;
 
-	address_space &memory = m_maincpu->space(AS_PROGRAM);
-	const u16 head = memory.read_word(0x041a);
-	const u16 tail = memory.read_word(0x041c);
-	if (head < 0x1e || head > 0x3c || (head & 1) ||
-		tail < 0x1e || tail > 0x3c || (tail & 1))
-		return;
+	// PC/XT start marker (1), followed by eight LSB-first bits.  The marker
+	// falling out of the shift register completes the byte, as on the XT.
+	const bool complete = BIT(m_keyboard_shift, 0);
+	m_keyboard_shift = (m_keyboard_shift >> 1) | (m_keyboard_data ? 0x80 : 0);
+	if (complete)
+	{
+		m_keyboard_latch = m_keyboard_shift;
+		m_keyboard_pending = true;
+		// As on the PC/XT, the full receive register holds DATA until ACK.
+		// This is controller flow control, not a software-writable data pin.
+		m_keyboard->data_write(0);
+		m_mb->m_pic8259->ir1_w(1);
+	}
+}
 
-	const u16 next_tail = (tail == 0x3c) ? 0x1e : tail + 2;
-	if (next_tail == head)
-		return;
+void ibmsimon_state::keyboard_data_w(int state)
+{
+	m_keyboard_data = bool(state);
+}
 
-	u8 scan = 0;
-	if (data == 0x0d) scan = 0x1c;
-	else if (data == 0x08) scan = 0x0e;
-	else if (data == 0x1b) scan = 0x01;
-	else if (data == 0x09) scan = 0x0f;
-	memory.write_word(0x0400 + tail, (u16(scan) << 8) | data);
-	memory.write_word(0x041c, next_tail);
+INPUT_CHANGED_MEMBER(ibmsimon_state::keyboard_connection_changed)
+{
+	// Removing the cable loses any half-received frame, but cannot erase a
+	// completed scan already in the VG230.  Its IRQ remains until BIOS ACKs.
+	m_keyboard_shift = 0;
+	m_keyboard->set_connected(newval == EXTERNAL_XT);
+}
+
+void ibmsimon_state::keyboard_postload()
+{
+	// Configuration switches are external to save states.  If the physical
+	// accessory changed since the snapshot, do not restore a phantom keyboard.
+	const bool connected = m_external_connector->read() == EXTERNAL_XT;
+	if (m_keyboard->connected() != connected)
+	{
+		m_keyboard_shift = 0;
+		m_keyboard->set_connected(connected);
+	}
+	m_keyboard->clock_write(BIT(m_ppi_b, 6));
+	m_keyboard->data_write(!m_keyboard_pending);
+	m_mb->m_pic8259->ir1_w(m_keyboard_pending);
+}
+
+u8 ibmsimon_state::external_accessory_id() const
+{
+	// RJ11 grounds all ID inputs through its identification resistors.
+	// Our XT adapter connects KBDVCC/GND/KBDCLK/KBDATA only, leaving IDs open.
+	// It is NOT claimed to reproduce a particular retail keyboard cable:
+	// US5619684 labels ID0 as the MSB, unlike the production BIOS packing.
+	// Combining its keyboard ID0 pull-down with the service manual's GPIO
+	// names yields 6, which this ROM uses to boot a service card (BFBB/F8FF9).
+	// Do not guess another resistor pattern or patch the ROM to suppress that.
+	return m_external_connector->read() == EXTERNAL_RJ11 ? 0 : 7;
 }
 
 void ibmsimon_state::ppi_b_w(u8 data)
 {
 	m_ppi_b = data;
+	if (BIT(data, 7))
+	{
+		m_keyboard_latch = 0;
+		m_keyboard_shift = 0;
+		m_keyboard_pending = false;
+		m_mb->m_pic8259->ir1_w(0);
+		m_keyboard->data_write(1);
+	}
+	// The external connector has an open-collector KBDCLK driver.  PB6=0
+	// pulls it low; releasing it after a long hold requests keyboard self-test.
+	m_keyboard->clock_write(BIT(data, 6));
 	m_mb->m_pit8253->write_gate2(BIT(data, 0));
 	m_mb->pc_speaker_set_spkrdata(BIT(data, 1));
 }
@@ -1520,7 +1740,9 @@ u8 ibmsimon_state::ppi_c_r()
 
 void ibmsimon_state::uart_update_irq()
 {
-	const bool irq = (m_uart_rx_count && BIT(m_uart_regs[1], 0)) || (m_uart_thre_irq && BIT(m_uart_regs[1], 1));
+	const bool irq = (m_uart_rx_ready && BIT(m_uart_regs[1], 0))
+		|| (m_uart_thre_irq && BIT(m_uart_regs[1], 1))
+		|| (m_uart_msr_delta && BIT(m_uart_regs[1], 3));
 	m_mb->m_pic8259->ir3_w(irq);
 }
 
@@ -1528,11 +1750,16 @@ TIMER_CALLBACK_MEMBER(ibmsimon_state::uart_tx_done)
 {
 	m_uart_tx_empty = true;
 	m_uart_thre_irq = true;
+	if (BIT(m_uart_regs[4], 4))
+		uart_rx_byte(m_uart_shift);
+	else
+		modem_receive_byte(m_uart_shift);
 	uart_update_irq();
 }
 
 TIMER_CALLBACK_MEMBER(ibmsimon_state::uart_rx_irq)
 {
+	m_uart_rx_ready = true;
 	// The XT PIC is edge triggered.  Present each received character on a new
 	// edge after its serial character time, never while the preceding ISR is
 	// still active.
@@ -1727,6 +1954,8 @@ void ibmsimon_state::rf_handset_command(u8 command)
 
 void ibmsimon_state::cellular_report_network()
 {
+	if (!m_phone_power)
+		return;
 	const u8 registration = (m_cellular_registration == 0xff)
 		? (m_cellular_system->read() & 0x07)
 		: m_cellular_registration;
@@ -1795,6 +2024,13 @@ void ibmsimon_state::cellular_link_command()
 		return;
 
 	const u8 command = std::toupper(m_cellular_link_line[0]);
+	// A connected host transport is not a powered RF transceiver.  Drop late
+	// air-interface packets after power-off, including a profile already in
+	// flight.  V programs the virtual NAM locally; M is the independent wired
+	// modem and must remain usable without Phone Power.
+	if (!m_phone_power && (command == 'R' || command == 'C' || command == 'H'
+		|| command == 'B' || command == 'S' || command == 'D' || command == 'G' || command == 'Y'))
+		return;
 	if (command == 'R')
 	{
 		if (m_phone_power)
@@ -1870,8 +2106,11 @@ void ibmsimon_state::cellular_link_command()
 	}
 	else if (command == 'H')
 	{
+		if (!m_modem_line_offhook && m_fax_phase != FX_IDLE) fax_finish(true);
 		const bool was_ringing = m_phone_ring;
-		const bool was_call = m_phone_call;
+		const bool was_call = m_phone_call || m_network_busy_audio;
+		if (!m_modem_line_offhook && m_fax_phase != FX_IDLE)
+			fax_finish(true);
 		const bool was_pager = m_phone_auto_answering;
 		m_phone_ring = false;
 		m_phone_call = false;
@@ -1905,8 +2144,11 @@ void ibmsimon_state::cellular_link_command()
 	{
 		// The called subscriber is busy.  This is not AMPS system congestion, so
 		// do not raise Simon's native "cellular system is busy" dialog.  Keep the
-		// caller off-hook/originating and open the downlink audio path; the AMPS
-		// switch supplies the busy cadence as ordinary voice samples until END.
+		// caller off-hook on a voice path to the network, not the subscriber.
+		// Leaving the deck at Origination (65h) while playing audio makes
+		// PHONE synchronously re-audit call setup and miss the End button.
+		if (!m_call_request_sent || m_phone_ring || m_phone_call)
+			return; // stale outcome after local End, or not our outgoing call
 		m_phone_ring = false;
 		m_phone_call = false;
 		m_phone_muted = false;
@@ -1915,22 +2157,72 @@ void ibmsimon_state::cellular_link_command()
 		m_voice_rx_started = false;
 		m_call_request_sent = true;
 		m_answer_request_sent = false;
-		m_rf_call_state = 0x65;
+		m_rf_call_state = 0x6b;
 		m_rf_event_phase = 0;
-		sio1_rx_byte(0x65);
+		sio1_rx_byte(m_rf_call_state);
+		sio1_rx_byte(0x80); // handset in use; no remote answer or microphone uplink
 		popmessage("Virtual 1G called subscriber busy\nBusy tone active - press END");
 	}
 	else if (command == 'M' && m_cellular_link_line_size >= 3 && m_cellular_link_line[1] == ' ')
 	{
 		const u8 result = std::toupper(m_cellular_link_line[2]);
+		if (result == 'F' && m_cellular_link_line_size > 4)
+		{
+			fax_link_event(std::string_view(reinterpret_cast<const char *>(m_cellular_link_line.data()+4), m_cellular_link_line_size-4));
+			return;
+		}
+		if (result == 'V')
+		{
+			// The PSTN/RJ11 voice bearer shares the transport, not the RF deck.
+			// Its answer/release/busy indications are heard over the line; they
+			// must not synthesize RF 6Bh or a data-modem CONNECT/NO CARRIER.
+			if (m_cellular_link_line_size >= 7 && m_cellular_link_line[4] == 'N')
+			{
+				std::string line(reinterpret_cast<const char *>(m_cellular_link_line.data()), m_cellular_link_line_size);
+				unsigned number = 0;
+				if (std::sscanf(line.c_str(), "M V N %u", &number) == 1)
+					m_modem_line_number = number; // socket number, never overwrite the RF NAM
+			}
+			else if (m_cellular_link_line_size >= 7 && m_cellular_link_line[4] == 'R')
+			{
+				// Real wall-line ringing reaches PHONE through COM2's RI input,
+				// not the RF incoming-call latch.  The original UI owns the ringer
+				// sound and the Answer control; do not synthesize a cellular call.
+				modem_ring_w(m_cellular_link_line[6] == '1'
+					&& m_external_connector->read() == EXTERNAL_RJ11 && !m_modem_line_offhook);
+			}
+			else if (m_cellular_link_line_size >= 5 && m_cellular_link_line[4] == 'H')
+			{
+				if (m_modem_line_offhook && m_fax_phase != FX_IDLE) fax_finish(true);
+				modem_ring_w(false);
+				m_voice_rx_head = m_voice_rx_tail = m_voice_rx_count = 0;
+				m_voice_rx_started = false;
+			}
+			else if (m_modem_line_offhook && m_cellular_link_line_size >= 5)
+			{
+				if (m_cellular_link_line[4] == 'Y')
+					voice_receive_packet(6, false);
+				else
+				{
+					m_voice_rx_head = m_voice_rx_tail = m_voice_rx_count = 0;
+					m_voice_rx_started = false;
+				}
+			}
+			return;
+		}
 		if (result == 'C')
 		{
+			// Ignore unsolicited/late carrier results after a cancelled dial or
+			// RF power-off.  M remains available for a genuine RJ11 dial request.
+			if (!m_rf_data_setup && !m_modem_dialing)
+				return;
 			// The stock Mail/Fax path originates the cellular leg through the
-			// INT 6Bh RF-deck interface, then consumes carrier and payload on the
+			// INT 15h/A0h RF-deck interface, then consumes carrier and payload on the
 			// separate Cirrus COM2 modem.  Assert both sides of that hardware
 			// hand-off: 6Bh completes the cellular call, CONNECT wakes RCONNECT.
 			if (m_rf_data_setup)
 			{
+				m_modem_rf_bearer = true;
 				m_phone_call = true;
 				m_phone_ring = false;
 				m_rf_call_state = 0x6b;
@@ -1942,48 +2234,53 @@ void ibmsimon_state::cellular_link_command()
 				// AT&F/ATS... into mail payload before the modem can answer OK.
 				m_modem_dialing = false;
 				m_modem_online = false;
+				m_modem_carrier = false;
 				m_modem_escape_count = 0;
 				return;
 			}
 			m_modem_dialing = false;
 			m_modem_online = true;
+			m_modem_carrier = true;
 			m_modem_escape_count = 0;
 			modem_result(10, "CONNECT 2400");
 		}
 		else if (result == 'B')
 		{
+			if (!m_rf_data_setup && !m_modem_dialing)
+				return;
+			m_modem_rf_bearer = false;
 			m_rf_data_setup = false;
 			m_call_request_sent = false;
 			m_modem_dialing = false;
 			m_modem_online = false;
+			m_modem_carrier = false;
 			modem_result(7, "BUSY");
 		}
 		else if (result == 'N' || result == 'H')
 		{
+			if (!m_rf_data_setup && !m_modem_dialing && !m_modem_carrier && !m_modem_rf_bearer)
+				return;
+			m_modem_rf_bearer = false;
 			m_rf_data_setup = false;
 			m_call_request_sent = false;
 			m_phone_call = false;
 			m_rf_call_state = 0x64;
 			m_modem_dialing = false;
 			m_modem_online = false;
+			m_modem_carrier = false;
 			m_modem_escape_count = 0;
 			modem_result(3, "NO CARRIER");
 		}
 		else if (result == 'X' && m_cellular_link_line_size >= 6)
 		{
-			auto const nibble = [] (u8 ch) -> int
-			{
-				ch = std::toupper(ch);
-				return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
-			};
 			for (unsigned pos = 4; pos + 1 < m_cellular_link_line_size; )
 			{
 				while (pos < m_cellular_link_line_size && m_cellular_link_line[pos] == ' ')
 					++pos;
 				if (pos + 1 >= m_cellular_link_line_size)
 					break;
-				const int high = nibble(m_cellular_link_line[pos++]);
-				const int low = nibble(m_cellular_link_line[pos++]);
+				const int high = hex_nibble(m_cellular_link_line[pos++]);
+				const int low = hex_nibble(m_cellular_link_line[pos++]);
 				if (high < 0 || low < 0)
 					break;
 				uart_rx_byte(u8((high << 4) | low));
@@ -1992,35 +2289,7 @@ void ibmsimon_state::cellular_link_command()
 	}
 	else if (command == 'Y' && m_cellular_link_line_size >= 4)
 	{
-		// 8 kHz unsigned PCM voice packet from the peer Simon.  Voice remains
-		// outside the guest CPU, as on the analogue AMPS hardware, while the
-		// RF/phone state machine still decides when the path is open.
-		auto const nibble = [] (u8 ch) -> int
-		{
-			ch = std::toupper(ch);
-			return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
-		};
-		for (unsigned pos = 2; pos + 1 < m_cellular_link_line_size; )
-		{
-			while (pos < m_cellular_link_line_size && m_cellular_link_line[pos] == ' ')
-				++pos;
-			if (pos + 1 >= m_cellular_link_line_size || (!m_phone_auto_answering && m_voice_rx_count >= m_voice_rx.size()))
-				break;
-			const int high = nibble(m_cellular_link_line[pos++]);
-			const int low = nibble(m_cellular_link_line[pos++]);
-			if (high < 0 || low < 0)
-				break;
-			const u8 sample = u8((high << 4) | low);
-			// A pager's signalling audio terminates inside the RF deck.  Feed it
-			// to the DTMF detector but never bridge it to Simon's earpiece DAC.
-			if (!m_phone_auto_answering)
-			{
-				m_voice_rx[m_voice_rx_tail] = sample;
-				m_voice_rx_tail = (m_voice_rx_tail + 1) % m_voice_rx.size();
-				++m_voice_rx_count;
-			}
-			modem_voice_sample(sample);
-		}
+		voice_receive_packet(2, m_phone_auto_answering);
 	}
 	else if (command == 'G')
 	{
@@ -2101,6 +2370,10 @@ void ibmsimon_state::cellular_link_command()
 	}
 	else if (command == 'V')
 	{
+		// A new transport session must learn the current physical jack state,
+		// even when the accessory did not change while the socket reconnected.
+		m_modem_jack_connected = false;
+		modem_update_jack();
 		// Virtual MIN supplied by the host switch.  The RF deck exposes a ten
 		// digit MIN/NAM field; shorter laboratory extension numbers are padded on
 		// the left, just like a programmed handset number.
@@ -2133,15 +2406,34 @@ void ibmsimon_state::cellular_link_command()
 	}
 	else if (command == 'I' && m_cellular_link_line_size >= 4)
 	{
-		auto const nibble = [] (u8 ch) -> int
-		{
-			ch = std::toupper(ch);
-			return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
-		};
-		const int high = nibble(m_cellular_link_line[2]);
-		const int low = nibble(m_cellular_link_line[3]);
+		const int high = hex_nibble(m_cellular_link_line[2]);
+		const int low = hex_nibble(m_cellular_link_line[3]);
 		if (high >= 0 && low >= 0)
 			sio1_rx_byte(u8((high << 4) | low));
+	}
+}
+
+void ibmsimon_state::voice_receive_packet(unsigned first, bool pager)
+{
+	for (unsigned pos = first; pos + 1 < m_cellular_link_line_size; )
+	{
+		while (pos < m_cellular_link_line_size && m_cellular_link_line[pos] == ' ')
+			++pos;
+		if (pos + 1 >= m_cellular_link_line_size || (!pager && m_voice_rx_count >= m_voice_rx.size()))
+			break;
+		const int high = hex_nibble(m_cellular_link_line[pos++]);
+		const int low = hex_nibble(m_cellular_link_line[pos++]);
+		if (high < 0 || low < 0)
+			break;
+		const u8 sample = u8((high << 4) | low);
+		// Numeric pages terminate inside the deck, without earpiece playback.
+		if (!pager)
+		{
+			m_voice_rx[m_voice_rx_tail] = sample;
+			m_voice_rx_tail = (m_voice_rx_tail + 1) % m_voice_rx.size();
+			++m_voice_rx_count;
+		}
+		modem_voice_sample(sample);
 	}
 }
 
@@ -2279,6 +2571,50 @@ void ibmsimon_state::modem_voice_sample(u8 sample)
 	uart_rx_byte(u8(found));
 }
 
+void ibmsimon_state::modem_ring_w(bool state)
+{
+	if (m_modem_ring_indicator == state)
+		return;
+	if (!state)
+		m_uart_msr_delta |= 0x04; // 8250 TERI: latch the end of a ring pulse
+	m_modem_ring_indicator = state;
+	uart_update_irq();
+}
+
+void ibmsimon_state::modem_update_jack()
+{
+	const bool connected = m_external_connector->read() == EXTERNAL_RJ11 && m_cellular_link->exists();
+	if (connected == m_modem_jack_connected)
+		return;
+	if (!connected)
+	{
+		modem_line_disconnect();
+		modem_ring_w(false);
+	}
+	m_modem_jack_connected = connected;
+	// Physical cable presence is distinct from Talk's off-hook relay.  The
+	// switch can now ring an idle plugged-in line with RF power completely off.
+	cellular_link_text(connected ? "M J 1\n" : "M J 0\n");
+}
+
+void ibmsimon_state::modem_line_disconnect()
+{
+	if (m_modem_line_offhook)
+	{
+		cellular_link_text("M L 0\n");
+		if (m_fax_phase != FX_IDLE)
+			fax_finish(true);
+		m_voice_rx_head = m_voice_rx_tail = m_voice_rx_count = 0;
+		m_voice_rx_started = false;
+		m_dtmf_digit = 0;
+		m_dtmf_samples = 0;
+		m_voice_tx_count = 0;
+	}
+	m_modem_line_offhook = false;
+	m_modem_tone_pending = false;
+	m_modem_tone_size = m_modem_tone_position = m_modem_tone_gap = 0;
+}
+
 void ibmsimon_state::modem_execute_command()
 {
 	std::string command(reinterpret_cast<const char *>(m_modem_command.data()), m_modem_command_size);
@@ -2292,19 +2628,18 @@ void ibmsimon_state::modem_execute_command()
 	// treating the pluses as command text makes Simon report a modem failure.
 	while (command.starts_with("+++"))
 		command.erase(0, 3);
+	// PHONE.EXE also terminates a possible voice stream before ATZ.  In
+	// command state DLE/ETX is a harmless abort, not part of the following AT.
+	while (command.starts_with("\x10\x03"))
+		command.erase(0, 2);
 	auto const information = [this] (std::string_view text)
 	{
 		if (m_modem_verbose)
-		{
 			modem_response("\r\n");
-			modem_response(text);
-			modem_response("\r\n");
-		}
-		else
-		{
-			modem_response(text);
-			modem_response("\r");
-		}
+		// V.250 table 3: information lines always end in CR LF. Only a
+		// numeric result code (e.g. 0 for OK) has a single CR terminator.
+		modem_response(text);
+		modem_response("\r\n");
 	};
 
 	if (!command.starts_with("AT"))
@@ -2315,13 +2650,16 @@ void ibmsimon_state::modem_execute_command()
 
 	if (command == "ATZ")
 	{
+		modem_line_disconnect();
 		m_modem_echo = true;
 		m_modem_verbose = true;
-		if (m_modem_online || m_modem_dialing)
+		if (m_modem_carrier || m_modem_dialing)
 			cellular_link_text("M H\n");
 		m_modem_online = false;
+		m_modem_carrier = false;
 		m_modem_dialing = false;
 		m_modem_voice = false;
+		m_modem_rf_bearer = false;
 		m_modem_escape_count = 0;
 		m_modem_fax_class = 0;
 	}
@@ -2349,6 +2687,25 @@ void ibmsimon_state::modem_execute_command()
 		m_modem_dtmf_stable = 0;
 		m_modem_dtmf_active = 0;
 	}
+	if (command == "AT#VLN=41" && m_external_connector->read() == EXTERNAL_RJ11)
+	{
+		if (m_phone_call || m_phone_ring || m_call_request_sent || m_modem_carrier || m_modem_dialing)
+		{
+			modem_result(4, "ERROR");
+			return;
+		}
+		if (!m_modem_line_offhook)
+		{
+			modem_update_jack();
+			modem_ring_w(false);
+			m_modem_line_offhook = true;
+			m_voice_rx_head = m_voice_rx_tail = m_voice_rx_count = 0;
+			m_voice_rx_started = false;
+			cellular_link_text("M L 1\n");
+		}
+	}
+	else if (command == "AT#VLN=0")
+		modem_line_disconnect();
 
 	// On the CL-MD1224/1624 firmware used by Simon, I4 is the fitted SRAM
 	// configuration query (the meaning was changed/reserved on later FastPath
@@ -2430,6 +2787,63 @@ void ibmsimon_state::modem_execute_command()
 		m_modem_fax_class = value - '0';
 	}
 
+	// FAXCHILD drives Class 1: HDLC control bursts and T.4 image bursts are
+	// DLE-framed at the DTE. The network only transports them on a real call.
+	if (m_modem_fax_class == 1 && (command == "AT+FTM=?" || command == "AT+FRM=?" ||
+			command == "AT+FTH=?" || command == "AT+FRH=?"))
+	{
+		information(command[5] == 'H' ? "3" : "24,48,72,96");
+		modem_result(0, "OK");
+		return;
+	}
+	// FAXCHILD dials the mobile number over RF, then sends "ATX3DT    ,"
+	// on the attached modem. The pause has no subscriber digits to dial.
+	const auto fax_dial_offset = command.find('D', 2);
+	const bool fax_dial = m_modem_fax_class == 1 && fax_dial_offset != command.npos &&
+		command.find_first_not_of("X0123456789 ", 2) == fax_dial_offset &&
+		command.find_first_not_of("TP, ", fax_dial_offset + 1) == command.npos;
+	if (m_modem_fax_class == 1 && (command.starts_with("AT+FT") || command.starts_with("AT+FR") ||
+		command == "ATA" || fax_dial))
+	{
+		if (!m_phone_call && !m_modem_line_offhook)
+		{
+			modem_result(3, "NO CARRIER");
+			return;
+		}
+		const bool answer = command == "ATA";
+		const bool transmit = answer || (!fax_dial && command[4] == 'T');
+		const char mode = (fax_dial || answer) ? 'H' : command[5];
+		std::string rate = "3";
+		if (!fax_dial && !answer)
+		{
+			if (command.size() < 8 || command.size() > 10 || command[6] != '=' ||
+				command.find_first_not_of("0123456789", 7) != command.npos)
+			{
+				modem_result(4, "ERROR");
+				return;
+			}
+			rate = command.substr(7);
+		}
+		m_fax_rx_paused = false;
+		if (mode == 'S')
+		{
+			m_fax_phase = FX_SILENCE;
+			m_fax_ticks = std::max(1, std::atoi(rate.c_str()));
+			return;
+		}
+		if (mode != 'H' && mode != 'M')
+		{
+			modem_result(4, "ERROR");
+			return;
+		}
+		m_fax_phase = transmit ? FX_TX_WAIT : FX_RX_WAIT;
+		m_fax_hdlc = mode == 'H';
+		m_fax_ticks = 3000;
+		m_fax_count = 0;
+		m_fax_dle = m_fax_credit = false;
+		cellular_link_text(std::string(transmit ? "M F TX " : "M F RX ") + mode + rate + "\n");
+		return;
+	}
 	if (command.starts_with("ATD") || command.find("DT") != std::string::npos)
 	{
 		std::size_t dial = command.starts_with("ATD") ? 3 : command.find("DT") + 2;
@@ -2445,20 +2859,41 @@ void ibmsimon_state::modem_execute_command()
 		}
 		if (message.size() > 4)
 		{
+			if (command.back() == ';')
+			{
+				// Native Wall Jack dialing uses ATM2X1DT<digits>;.  A trailing
+				// semicolon emits tones and returns to command state, never waits
+				// for a data carrier.  Finish OK only after the actual PCM tones.
+				if (!m_modem_line_offhook || m_modem_tone_pending)
+				{
+					modem_result(4, "ERROR");
+					return;
+				}
+				m_modem_tone_size = message.size() - 4;
+				std::copy(message.begin() + 4, message.end(), m_modem_tone_digits.begin());
+				m_modem_tone_position = 0;
+				m_modem_tone_gap = 0;
+				m_modem_tone_pending = true;
+				return;
+			}
 			message.push_back('\n');
 			cellular_link_text(message);
+			m_modem_rf_bearer = false; // explicit COM2 dial, not RF-originated ATD
 			m_modem_dialing = true;
 			m_modem_online = false;
+			m_modem_carrier = false;
 			return; // CONNECT/BUSY/NO CARRIER is asynchronous from the switch.
 		}
 		// Simon's cellular Mail/Fax stack originates the telephone number over
-		// INT 6Bh first.  Its bare ATD then asks the CL-MD1224 to train on that
+		// INT 15h/A001 first.  Its bare ATD then asks the CL-MD1224 to train on that
 		// already-established analogue bearer; it is not a request for a second
 		// telephone dial.  Assert modem carrier only at this final stage.
 		if (command == "ATD" && m_phone_call)
 		{
+			m_modem_rf_bearer = true;
 			m_modem_dialing = false;
 			m_modem_online = true;
+			m_modem_carrier = true;
 			m_modem_escape_count = 0;
 			modem_result(10, "CONNECT 2400");
 			return;
@@ -2468,11 +2903,14 @@ void ibmsimon_state::modem_execute_command()
 	}
 	else if (command == "ATH" || command.starts_with("ATH0"))
 	{
-		if (m_modem_online || m_modem_dialing)
+		modem_line_disconnect();
+		if (m_modem_carrier || m_modem_dialing)
 			cellular_link_text("M H\n");
 		m_modem_online = false;
+		m_modem_carrier = false;
 		m_modem_dialing = false;
 		m_modem_escape_count = 0;
+		m_modem_rf_bearer = false;
 	}
 	else if (command.find("#VCL=0") != std::string::npos)
 	{
@@ -2489,34 +2927,197 @@ void ibmsimon_state::modem_execute_command()
 	modem_result(0, "OK");
 }
 
+void ibmsimon_state::modem_send_data(u8 data)
+{
+	static constexpr char hex[] = "0123456789ABCDEF";
+	const char message[] = { 'M', ' ', 'X', ' ', hex[data >> 4], hex[data & 0x0f], '\n' };
+	cellular_link_text(std::string_view(message, sizeof(message)));
+}
+
+TIMER_CALLBACK_MEMBER(ibmsimon_state::modem_escape_timeout)
+{
+	if (m_modem_online && m_modem_escape_count == 3)
+	{
+		// Hayes escape requires silence both before and after exactly three
+		// pluses.  Otherwise '+' is ordinary binary payload, including URLs.
+		m_modem_online = false;
+		modem_result(0, "OK");
+	}
+	else if (m_modem_online)
+	{
+		for (u8 i = 0; i < m_modem_escape_count; ++i)
+			modem_send_data('+');
+	}
+	m_modem_escape_count = 0;
+}
+
+void ibmsimon_state::fax_flush()
+{
+	static constexpr char hex[] = "0123456789ABCDEF";
+	if (!m_fax_count)
+		return;
+	std::string message("M F X ");
+	for (unsigned i = 0; i < m_fax_count; ++i)
+	{
+		const u8 byte = m_fax_tx[i];
+		message += hex[byte >> 4];
+		message += hex[byte & 15];
+	}
+	message += '\n';
+	cellular_link_text(message);
+	m_fax_count = 0;
+}
+
+void ibmsimon_state::fax_buffer_byte(u8 data)
+{
+	m_fax_tx[m_fax_count++] = data;
+	if (m_fax_count == m_fax_tx.size())
+		fax_flush();
+}
+
+void ibmsimon_state::fax_finish(bool carrier_lost)
+{
+	bool bad_frame = false;
+	if (m_fax_phase == FX_RX)
+	{
+		// The HDLC FCS, little-endian on the wire, is included in the
+		// received data delivered to the DTE. Its good residual is F0B8h.
+		bad_frame = m_fax_hdlc && m_fax_crc != 0xf0b8;
+		uart_rx_byte(0x10);
+		uart_rx_byte(0x03);
+	}
+	m_fax_phase = FX_IDLE;
+	m_fax_ticks = m_fax_count = 0;
+	m_fax_dle = m_fax_credit = m_fax_rx_paused = false;
+	if (carrier_lost)
+		modem_result(3, "NO CARRIER");
+	else if (bad_frame)
+		modem_result(4, "ERROR");
+	else
+		modem_result(0, "OK");
+}
+
+void ibmsimon_state::fax_link_event(std::string_view event)
+{
+	if (m_fax_phase == FX_IDLE)
+		return;
+	if (event == "FAIL")
+	{
+		fax_finish(true);
+		return;
+	}
+	if ((event == "READY" && m_fax_phase == FX_TX_WAIT) ||
+		(event == "START" && m_fax_phase == FX_RX_WAIT))
+	{
+		m_fax_phase = event == "READY" ? FX_TX : FX_RX;
+		m_fax_crc = 0xffff;
+		m_fax_octets = 0;
+		m_fax_final = true;
+		modem_result(1, "CONNECT");
+	}
+	else if (event == "OK" && m_fax_phase == FX_TX_END && m_fax_hdlc && !m_fax_final)
+	{
+		// A non-final V.21 frame keeps the carrier. The DTE sends another
+		// frame after CONNECT, without issuing a second +FTH command.
+		m_fax_phase = FX_TX_WAIT;
+		cellular_link_text("M F TX H3\n");
+	}
+	else if ((event == "END" && m_fax_phase == FX_RX) || (event == "OK" && m_fax_phase == FX_TX_END))
+		fax_finish(false);
+	else if (m_fax_phase == FX_RX && event.starts_with("X ") && event.size() <= 130 && event.size() % 2 == 0)
+	{
+		for (unsigned i = 2; i < event.size(); i += 2)
+		{
+			const int high = hex_nibble(event[i]);
+			const int low = hex_nibble(event[i + 1]);
+			if (high < 0 || low < 0)
+			{
+				fax_finish(true);
+				return;
+			}
+			const u8 byte = (high << 4) | low;
+			if (m_fax_hdlc)
+				m_fax_crc = hdlc_crc_byte(m_fax_crc, byte);
+			uart_rx_byte(byte);
+			if (byte == 0x10)
+				uart_rx_byte(byte);
+		}
+		m_fax_credit = false;
+		m_fax_ticks = 3000;
+	}
+}
+
 void ibmsimon_state::modem_receive_byte(u8 data)
 {
-	if (m_modem_online)
+	// FAXCHILD throttles page reception using XOFF and XON. The last XON
+	// can follow the carrier's end and must not prefix the next AT command.
+	if (m_modem_fax_class == 1 && !m_modem_online &&
+		(m_fax_phase == FX_RX || m_fax_phase == FX_RX_WAIT || m_fax_phase == FX_IDLE) &&
+		(data == 0x11 || data == 0x13))
 	{
-		const u16 ss = m_maincpu->state_int(NEC_SS);
-		const u16 sp = m_maincpu->state_int(NEC_SP);
-		auto &space = m_maincpu->space(AS_PROGRAM);
-		const u32 stack = (u32(ss) << 4) + sp;
-		logerror("Simon modem data TX pc=%05X cs:ip=%04X:%04X byte=%02X stack=%04X,%04X,%04X,%04X\n",
-			m_maincpu->pc(), u16(m_maincpu->state_int(NEC_PS)), u16(m_maincpu->state_int(NEC_PC)), data,
-			space.read_word(stack), space.read_word(stack + 2), space.read_word(stack + 4), space.read_word(stack + 6));
-		// Hayes guard times are intentionally relaxed for the virtual bearer.
-		// Three consecutive plus characters return to command mode; all other
-		// bytes are transported losslessly to the switch as hexadecimal octets.
-		if (data == '+')
+		m_fax_rx_paused = data == 0x13;
+		return;
+	}
+	if (m_fax_phase == FX_TX)
+	{
+		m_fax_ticks = 3000;
+		if (m_fax_dle && data == 3)
 		{
-			if (++m_modem_escape_count == 3)
+			if (m_fax_hdlc && m_fax_octets)
 			{
-				m_modem_online = false;
-				m_modem_escape_count = 0;
-				modem_result(0, "OK");
+				const u16 fcs = ~m_fax_crc;
+				fax_buffer_byte(u8(fcs));
+				fax_buffer_byte(u8(fcs >> 8));
 			}
+			fax_flush();
+			cellular_link_text(m_fax_hdlc && !m_fax_octets ? "M F EOT\n" : "M F DONE\n");
+			m_fax_phase = FX_TX_END;
+			m_fax_dle = false;
 			return;
 		}
+		if (!m_fax_dle && data == 0x10)
+		{
+			m_fax_dle = true;
+			return;
+		}
+		m_fax_dle = false;
+		if (m_fax_hdlc)
+		{
+			if (m_fax_octets == 1)
+				m_fax_final = BIT(data, 4);
+			++m_fax_octets;
+			m_fax_crc = hdlc_crc_byte(m_fax_crc, data);
+		}
+		fax_buffer_byte(data);
+		return;
+	}
+	if (m_fax_phase != FX_IDLE)
+	{
+		cellular_link_text("M F ABORT\n");
+		fax_finish(true);
+		return;
+	}
+	if (m_modem_online)
+	{
+		// Online bytes may contain mail credentials, forms or private messages.
+		const attotime now = machine().time();
+		const attotime guard = attotime::from_seconds(1);
+		if (data == '+' && m_modem_escape_count < 3 &&
+			(m_modem_escape_count || now - m_modem_last_tx >= guard))
+		{
+			++m_modem_escape_count;
+			m_modem_last_tx = now;
+			m_modem_escape_timer->adjust(guard);
+			return;
+		}
+		// A non-plus or fourth plus invalidates the candidate.  Return all
+		// withheld bytes, in order, before the byte which invalidated it.
+		m_modem_escape_timer->adjust(attotime::never);
+		for (u8 i = 0; i < m_modem_escape_count; ++i)
+			modem_send_data('+');
 		m_modem_escape_count = 0;
-		static constexpr char hex[] = "0123456789ABCDEF";
-		const char message[] = { 'M', ' ', 'X', ' ', hex[data >> 4], hex[data & 0x0f], '\n' };
-		cellular_link_text(std::string_view(message, sizeof(message)));
+		m_modem_last_tx = now;
+		modem_send_data(data);
 		return;
 	}
 
@@ -2541,12 +3142,55 @@ void ibmsimon_state::modem_receive_byte(u8 data)
 		m_modem_command[m_modem_command_size++] = data;
 }
 
+void ibmsimon_state::rf_power_off()
+{
+	if (!m_modem_line_offhook && m_fax_phase != FX_IDLE)
+		fax_finish(true);
+	if (m_rf_ready_announced)
+		cellular_link_text("F 0\n");
+	m_rf_ready_announced = false;
+	m_phone_power = false;
+	m_cellular_registration = m_cellular_link->exists() ? 0xfe : 0xff;
+	m_cellular_signal = m_cellular_link->exists() ? 0 : 6;
+	m_cellular_operator.fill(0);
+	if (m_modem_rf_bearer || m_rf_data_setup)
+	{
+		if (m_modem_carrier || m_modem_dialing)
+			modem_result(3, "NO CARRIER");
+		m_modem_online = false;
+		m_modem_carrier = false;
+		m_modem_dialing = false;
+		m_modem_rf_bearer = false;
+		m_modem_escape_count = 0;
+		m_modem_escape_timer->adjust(attotime::never);
+	}
+	m_phone_call = false;
+	m_phone_ring = false;
+	m_phone_auto_answering = false;
+	m_phone_muted = false;
+	m_network_busy_audio = false;
+	if (!m_modem_line_offhook)
+	{
+		m_voice_rx_head = m_voice_rx_tail = m_voice_rx_count = 0;
+		m_voice_rx_started = false;
+	}
+	m_rf_call_state = 0x64;
+	m_call_request_sent = false;
+	m_rf_data_setup = false;
+	m_rf_dial_pending = false;
+	m_answer_request_sent = false;
+	m_rf_event_phase = 0;
+	m_rf_event_ticks = 0;
+}
+
 void ibmsimon_state::rf_receive_byte(u8 data)
 {
 	// The production hardware has two independent serial devices.  COM1 is
 	// the Mitsubishi RF deck's three-wire control link; COM2 is the Cirrus
-	// data/fax modem.  Keep the raw deck traffic visible to the host switch.
-	cellular_link_output(data);
+	// data/fax modem.  POST and configuration exchanges are local even with
+	// RF power off; they must not masquerade as network registration/traffic.
+	if (m_phone_power)
+		cellular_link_output(data);
 	if (m_rf_tx_address == 0x70)
 	{
 		// PHONE 55F36, 5C8CF and 5C940 send 70h followed by 10h + volume
@@ -2604,29 +3248,25 @@ void ibmsimon_state::rf_receive_byte(u8 data)
 	// amber indicator independent from both BIOS POST and main-unit suspend.
 	if (data == 0x7f)
 	{
+		if (!BIT(m_vg230_regs[0xc6 + (m_vg230_regs[0xc0] & 3)], 7))
+			return; // VP7 supply removed: a serial byte cannot power the deck
 		if (!m_phone_power)
 		{
 			m_phone_power = true;
+			m_rf_ready_announced = true;
+			if (m_cellular_link->exists())
+			{
+				m_cellular_registration = 0xfe; // await a live control-channel profile
+				m_cellular_signal = 0;
+				cellular_link_text("N\n");
+			}
 			rf_schedule_event(6, 20);
 		}
 		return;
 	}
 	if (data == 0x8c)
 	{
-		m_phone_power = false;
-		m_phone_call = false;
-		m_phone_ring = false;
-		m_phone_auto_answering = false;
-		m_phone_muted = false;
-		m_network_busy_audio = false;
-		m_voice_rx_head = m_voice_rx_tail = m_voice_rx_count = 0;
-		m_voice_rx_started = false;
-		m_call_request_sent = false;
-		m_rf_data_setup = false;
-		m_rf_dial_pending = false;
-		m_answer_request_sent = false;
-		m_rf_event_phase = 0;
-		m_rf_event_ticks = 0;
+		rf_power_off();
 		return;
 	}
 
@@ -2696,7 +3336,9 @@ void ibmsimon_state::rf_receive_byte(u8 data)
 	if (data == 0x88 && (m_phone_ring || m_phone_call || m_call_request_sent))
 	{
 		const bool was_ringing = m_phone_ring;
-		const bool was_call = m_phone_call;
+		const bool was_call = m_phone_call || m_network_busy_audio;
+		if (!m_modem_line_offhook && m_fax_phase != FX_IDLE)
+			fax_finish(true);
 		m_phone_ring = false;
 		m_phone_call = false;
 		m_phone_muted = false;
@@ -2792,13 +3434,15 @@ void ibmsimon_state::rf_receive_byte(u8 data)
 		{
 			m_rf_dial_frame = false;
 			m_rf_dial_pending = data == 0x89 && !m_rf_data_setup && m_rf_dial_size;
-			if (data == 0x89 && m_rf_data_setup && m_rf_dial_size)
+			if (data == 0x89 && m_rf_data_setup && m_rf_dial_size && m_phone_power)
 			{
-				std::string message("M D ");
+				// COM1 originates the RF leg. COM2 remains idle until its own
+				// ATD, so initializing it with ATZ must leave this call up.
+				std::string message("O ");
 				message.append(reinterpret_cast<const char *>(m_rf_dial_digits.data()), m_rf_dial_size);
 				message.push_back('\n');
 				cellular_link_text(message);
-				m_modem_dialing = true;
+				m_modem_rf_bearer = true;
 				m_modem_online = false;
 				m_call_request_sent = true;
 			}
@@ -2877,7 +3521,7 @@ void ibmsimon_state::rf_receive_byte(u8 data)
 	// treats 0eh as the muted state (it sets its Phone Muted flag and changes
 	// the button to Unmute); 0fh is the normal, unmuted voice path.  Leaving the
 	// query unanswered makes the application time out and re-audit the deck.
-	if (!m_rf_tx_address && data == 0x0d && m_phone_call)
+	if (!m_rf_tx_address && data == 0x0d && (m_phone_call || m_network_busy_audio))
 	{
 		sio1_rx_byte(m_phone_muted ? 0x0e : 0x0f);
 		return;
@@ -2887,13 +3531,13 @@ void ibmsimon_state::rf_receive_byte(u8 data)
 	// restores the voice path, then audits the result with 0Dh.  Both bytes can
 	// also be handset keypad commands when preceded by an address, so only
 	// consume them with no pending address.
-	if (!m_rf_tx_address && data == 0x0e && m_phone_call)
+	if (!m_rf_tx_address && data == 0x0e && (m_phone_call || m_network_busy_audio))
 	{
 		m_phone_muted = true;
 		return;
 	}
 
-	if (!m_rf_tx_address && data == 0x0f && m_phone_call)
+	if (!m_rf_tx_address && data == 0x0f && (m_phone_call || m_network_busy_audio))
 	{
 		m_phone_muted = false;
 		return;
@@ -2943,9 +3587,10 @@ u8 ibmsimon_state::uart_r(offs_t offset)
 	switch (offset)
 	{
 	case 0:
-		if (m_uart_rx_count)
+		if (m_uart_rx_ready)
 		{
 			const u8 data = m_uart_rx[m_uart_rx_head];
+			m_uart_rx_ready = false;
 			m_uart_rx_head = (m_uart_rx_head + 1) % m_uart_rx.size();
 			--m_uart_rx_count;
 			// COM2 is the data/fax modem on IRQ3.  It must never clear COM1's
@@ -2962,7 +3607,7 @@ u8 ibmsimon_state::uart_r(offs_t offset)
 	case 1:
 		return m_uart_regs[1];
 	case 2:
-		if (m_uart_rx_count && BIT(m_uart_regs[1], 0))
+		if (m_uart_rx_ready && BIT(m_uart_regs[1], 0))
 			return 0x04;
 		if (m_uart_thre_irq && BIT(m_uart_regs[1], 1))
 		{
@@ -2970,13 +3615,25 @@ u8 ibmsimon_state::uart_r(offs_t offset)
 			uart_update_irq();
 			return 0x02;
 		}
+		if (m_uart_msr_delta && BIT(m_uart_regs[1], 3))
+			return 0x00; // modem-status interrupt, acknowledged by reading MSR
 		return 0x01;
 	case 5:
-		return (m_uart_tx_empty ? 0x60 : 0x00) | (m_uart_rx_count ? 0x01 : 0x00);
+		return (m_uart_tx_empty ? 0x60 : 0x00) | (m_uart_rx_ready ? 0x01 : 0x00);
 	case 6:
-		// COM2 is the separate data/fax modem.  Keep its idle handshake asserted;
-		// cellular RI/DCD belong to the RF deck on COM1, not this UART.
-		return 0x30;
+	{
+		// COM2 DCD follows the data carrier, independently of the COM1 RF call.
+		// Escaping with guarded +++ enters command mode without dropping the
+		// carrier; a later ATH0 must still release that established connection.
+		const u8 result = 0x30 | (m_modem_carrier ? 0x80 : 0x00)
+			| (m_modem_ring_indicator ? 0x40 : 0x00) | m_uart_msr_delta;
+		if (!machine().side_effects_disabled())
+		{
+			m_uart_msr_delta = 0;
+			uart_update_irq();
+		}
+		return result;
+	}
 	default:
 		return m_uart_regs[offset];
 	}
@@ -3102,10 +3759,7 @@ void ibmsimon_state::uart_w(offs_t offset, u8 data)
 	case 0:
 		m_uart_thre_irq = false;
 		m_uart_tx_empty = false;
-		if (BIT(m_uart_regs[4], 4))
-			uart_rx_byte(data);
-		else
-			modem_receive_byte(data);
+		m_uart_shift = data;
 		// The integrated SIO uses the standard 1.8432 MHz UART clock.  Model
 		// one start bit, eight data bits and one stop bit before THRE rises.
 		m_uart_tx_timer->adjust(attotime::from_ticks(std::max<u16>(m_uart_divisor, 1) * 160, 1'843'200));
@@ -3173,6 +3827,8 @@ u8 ibmsimon_state::external_buttons_r()
 		result &= ~u8(0x20); // Up
 	if (BIT(m_external_buttons->read(), 2))
 		result &= ~u8(0x10); // Down
+	if (!BIT(external_accessory_id(), 2))
+		result &= ~u8(0x08); // accessory ID2: sampled by BIOS A000/A008
 	return result;
 }
 
@@ -3205,25 +3861,56 @@ void ibmsimon_state::touch_control_w(u8 data)
 	// Mitsubishi RF deck.  A healthy deck finishes POST with status 21h.
 	if (BIT(previous, 3) && !BIT(data, 3))
 	{
-		// Every RF power/reset test requires a fresh 21h POST response.  This is
-		// separate from the host-switch registration handshake below: suppressing
-		// repeated N packets must never suppress the hardware acknowledgement.
+		// Every RF reset test requires a fresh local 21h POST response.  The
+		// transceiver remains off until its native 7Fh command; POST must neither
+		// register with the cell site nor request an operator profile.
 		sio1_rx_byte(0x21);
 		m_rf_control_mode = true;
-		if (!m_rf_ready_announced)
-		{
-			// Tell a connected virtual switch that the RF deck can now consume its
-			// registration profile.  The switch may have accepted the socket before
-			// BIOS POST, so its initial S line is not sufficient as a handshake.
-			m_rf_ready_announced = true;
-			cellular_link_text("N\n");
-		}
 		// Do not emit a complete unsolicited registration sequence on every
 		// board-latch reset pulse.  PHONE.EXE pulses this line during its ordinary
 		// audits; repeatedly injecting 83/84/Ax/64 creates needless COM1 IRQ load
 		// and makes all Navigator applications sluggish.  The 7Fh phone-power
 		// command and switch S profile already provide the required report once.
 	}
+}
+
+bool ibmsimon_state::battery_low() const
+{
+const u8 source = m_battery->read();
+	return source == 2 ? m_host_battery_low : source == 1;
+}
+
+TIMER_CALLBACK_MEMBER(ibmsimon_state::battery_sample)
+{
+	// Host queries run at the PMU sampling rate, independent of firmware port reads.
+#if defined(__ANDROID__)
+	if (m_battery->read() == 2)
+		m_host_battery_low = simon_android_battery_low();
+#elif defined(_WIN32)
+	if (m_battery->read() == 2)
+		m_host_battery_low = osd_windows_battery_low();
+#endif
+	// VG230 LB is an external voltage-comparator input. With the LB NMI
+	// enabled the first interrupt occurs within 15 s, then every 60 s.
+	if (!m_main_power || BIT(m_vg230_regs[0xc4], 2) || !battery_low())
+	{
+		m_battery_nmi_delay = 15;
+		return;
+	}
+	if (!--m_battery_nmi_delay)
+	{
+		pmu_nmi(2);
+		m_battery_nmi_delay = 60;
+	}
+}
+
+void ibmsimon_state::pmu_nmi(u8 cause)
+{
+	if (BIT(m_vg230_regs[0xc4], cause) || BIT(m_vg230_regs[0x19], 0))
+		return;
+	m_vg230_regs[0x19] |= 0x01;
+	m_vg230_regs[0xc0] = (m_vg230_regs[0xc0] & ~u8(0x1c)) | (cause << 2);
+	pcmcia_update_irq();
 }
 
 INPUT_CHANGED_MEMBER(ibmsimon_state::power_button)
@@ -3235,15 +3922,8 @@ INPUT_CHANGED_MEMBER(ibmsimon_state::power_button)
 	{
 		pmu_resume(1); // EXT switch, never a reset or forced application exit
 	}
-	else if (!BIT(m_vg230_regs[0xc4], 1) && !BIT(m_vg230_regs[0x19], 0))
-	{
-		// EXT raises PMU NMI cause 001.  BIOS may defer it while DOS is busy;
-		// never freeze the CPU in the middle of a card write or RF operation.
-		m_vg230_regs[0x19] |= 0x01;
-		m_vg230_regs[0xc0] = (m_vg230_regs[0xc0] & 0xe3) | 0x04;
-		pcmcia_update_irq();
-		logerror("Simon PMU EXT suspend request pc=%05X\n", m_maincpu->pc());
-	}
+	else
+		pmu_nmi(1);
 }
 
 void ibmsimon_state::pmu_resume(u8 source)
@@ -3344,13 +4024,32 @@ TIMER_CALLBACK_MEMBER(ibmsimon_state::touch_tick)
 
 TIMER_CALLBACK_MEMBER(ibmsimon_state::voice_tick)
 {
+	if (m_modem_line_offhook && m_external_connector->read() != EXTERNAL_RJ11)
+		modem_line_disconnect();
+	if (m_modem_tone_pending && !m_dtmf_samples)
+	{
+		if (m_modem_tone_gap)
+			--m_modem_tone_gap;
+		else if (m_modem_tone_position < m_modem_tone_size)
+		{
+			m_dtmf_digit = m_modem_tone_digits[m_modem_tone_position++];
+			m_dtmf_samples = 760; // 95 ms DTMF, followed by a 95 ms interdigit gap
+			m_modem_tone_gap = 760;
+			m_dtmf_low_phase = m_dtmf_high_phase = 0;
+		}
+		else
+		{
+			m_modem_tone_pending = false;
+			modem_result(0, "OK");
+		}
+	}
 	if (m_pager_beep_samples)
 	{
 		const double phase = 6.28318530717958647692 * 1050.0 * double(m_pager_beep_phase++) / 8000.0;
 		m_voice_dac->data_w(u8(std::clamp(128 + int(52.0 * std::sin(phase)), 0, 255)));
 		--m_pager_beep_samples;
 	}
-	else if (m_phone_call || m_network_busy_audio || m_call_request_sent)
+	else if (m_phone_call || m_network_busy_audio || m_call_request_sent || m_modem_line_offhook)
 	{
 		// Buffer three 20 ms network intervals before starting the earpiece.
 		// TCP arrivals and the emulation scheduler have different clocks; playing
@@ -3376,7 +4075,12 @@ TIMER_CALLBACK_MEMBER(ibmsimon_state::voice_tick)
 		m_voice_dac->data_w(0x80);
 	}
 
-	if (!m_phone_call)
+#ifdef __ANDROID__
+	const bool talk = (m_phone_call && !m_modem_rf_bearer) || (m_modem_line_offhook && m_modem_voice);
+	const s16 microphone = simon_android_microphone_sample(talk && !m_phone_muted
+			&& !m_phone_auto_answering && !m_voice_input->exists() && m_fax_phase == FX_IDLE);
+#endif
+	if (!m_phone_call && !m_modem_line_offhook)
 	{
 		m_voice_tx_count = 0;
 		m_dtmf_digit = 0;
@@ -3384,9 +4088,16 @@ TIMER_CALLBACK_MEMBER(ibmsimon_state::voice_tick)
 		return;
 	}
 
-	double sample = (!m_phone_muted && m_voice_input->exists())
-		? std::clamp(m_voice_input->input(), -1.0, 1.0)
-		: 0.0;
+	double sample = 0.0;
+	if (!m_phone_muted)
+	{
+		if (m_voice_input->exists())
+			sample = std::clamp(m_voice_input->input(), -1.0, 1.0);
+#ifdef __ANDROID__
+		else
+			sample = microphone / 32768.0;
+#endif
+	}
 
 	if (m_dtmf_samples && m_dtmf_digit)
 	{
@@ -3414,6 +4125,8 @@ TIMER_CALLBACK_MEMBER(ibmsimon_state::voice_tick)
 			const double tone = 0.32 * std::sin(double(m_dtmf_low_phase) * phase_scale)
 				+ 0.32 * std::sin(double(m_dtmf_high_phase) * phase_scale);
 			sample = std::clamp(sample * 0.35 + tone, -1.0, 1.0);
+			if (m_modem_line_offhook)
+				m_voice_dac->data_w(u8(std::clamp<int>(int(tone * 96.0) + 128, 0, 255)));
 			m_dtmf_low_phase += u32((u64(low) << 32) / 8000);
 			m_dtmf_high_phase += u32((u64(high) << 32) / 8000);
 		}
@@ -3425,23 +4138,36 @@ TIMER_CALLBACK_MEMBER(ibmsimon_state::voice_tick)
 	if (m_voice_tx_count == m_voice_tx.size())
 	{
 		static constexpr char hex[] = "0123456789ABCDEF";
-		std::array<char, 2 + 160 * 2 + 1> frame;
-		frame[0] = 'Y';
-		frame[1] = ' ';
-		unsigned pos = 2;
+		std::array<char, 6 + 160 * 2 + 1> frame;
+		const std::string_view prefix = m_modem_line_offhook ? "M V Y " : "Y ";
+		std::copy(prefix.begin(), prefix.end(), frame.begin());
+		unsigned pos = prefix.size();
 		for (u8 value : m_voice_tx)
 		{
 			frame[pos++] = hex[value >> 4];
 			frame[pos++] = hex[value & 0x0f];
 		}
 		frame[pos] = '\n';
-		cellular_link_text(std::string_view(frame.data(), frame.size()));
+		cellular_link_text(std::string_view(frame.data(), pos + 1));
 		m_voice_tx_count = 0;
 	}
 }
 
 TIMER_CALLBACK_MEMBER(ibmsimon_state::cellular_link_tick)
 {
+	if (m_fax_phase != FX_IDLE && !m_fax_rx_paused && m_fax_ticks && !--m_fax_ticks)
+	{
+		const bool failed = m_fax_phase != FX_SILENCE;
+		if (failed)
+			cellular_link_text("M F ABORT\n");
+		fax_finish(failed);
+	}
+	if (m_fax_phase == FX_RX && !m_fax_rx_paused && !m_fax_credit && m_uart_rx_count < 64)
+	{
+		cellular_link_text("M F NEXT\n");
+		m_fax_credit = true;
+	}
+	modem_update_jack();
 	if (!m_cellular_link->exists())
 		return;
 	// Drain available bursts independently of the 20 Hz RF state sequencer.
@@ -3613,7 +4339,7 @@ void ibmsimon_state::io_map(address_map &map)
 	map(0x0026, 0x0026).w(FUNC(ibmsimon_state::vg230_index_w));
 	map(0x0027, 0x0027).rw(FUNC(ibmsimon_state::vg230_data_r), FUNC(ibmsimon_state::vg230_data_w));
 	map(0x0040, 0x004f).rw("mb:pit8253", FUNC(pit8253_device::read), FUNC(pit8253_device::write));
-	map(0x0060, 0x0060).lr8(NAME([this]() { return m_vg230_regs[0x0a]; }));
+	map(0x0060, 0x0060).rw(FUNC(ibmsimon_state::keyboard_r), FUNC(ibmsimon_state::keyboard_w));
 	map(0x0061, 0x0061).rw(FUNC(ibmsimon_state::ppi_b_r), FUNC(ibmsimon_state::ppi_b_w));
 	map(0x0062, 0x0062).lrw8(NAME([this]() { return ppi_c_r(); }), NAME([](u8) { }));
 	map(0x006c, 0x006c).lrw8(NAME([this]() { return m_map_address; }), NAME([this](u8 data) { m_map_address = data; }));
@@ -3653,8 +4379,23 @@ u32 ibmsimon_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, c
 	// backlight.  PWRON VP0 enables the panel supply while CFh's activity timer
 	// controls the visible backlight state emulated above.
 	const bool backlight = m_lcd_backlight;
-	const rgb_t paper = backlight ? rgb_t(0xf4, 0xf2, 0xdf) : rgb_t(0xa9, 0xad, 0x91);
-	const rgb_t ink = backlight ? rgb_t(0x18, 0x1b, 0x18) : rgb_t(0x43, 0x48, 0x3c);
+	const rgb_t clear = backlight ? rgb_t(0xf4, 0xf2, 0xdf) : rgb_t(0xa9, 0xad, 0x91);
+	const rgb_t midpoint = backlight ? rgb_t(0x18, 0x1b, 0x18) : rgb_t(0x43, 0x48, 0x3c);
+	// A multiplexed LCD applies voltage to unselected pixels too. As bias
+	// rises they darken after the selected pixels already look black. This
+	// approximates the glass response; the BIOS stops at counter value 59.
+	const int above_midpoint = std::clamp(int(m_lcd_contrast) - 32, 0, 27);
+	auto paper_channel = [above_midpoint](int light, int dark) {
+		return light - (light - dark / 2) * above_midpoint * above_midpoint / (27 * 27);
+	};
+	const rgb_t paper(paper_channel(clear.r(), midpoint.r()), paper_channel(clear.g(), midpoint.g()),
+		paper_channel(clear.b(), midpoint.b()));
+	auto ink_channel = [this](int paper, int ink) {
+		if (m_lcd_contrast < 32)
+			return ink + (paper - ink) * (32 - m_lcd_contrast) / 32;
+		return ink * (64 - m_lcd_contrast) / 32;
+	};
+	const rgb_t ink(ink_channel(paper.r(), midpoint.r()), ink_channel(paper.g(), midpoint.g()), ink_channel(paper.b(), midpoint.b()));
 	// VG230 CRTC index C2h bit 0 reverses the LCD polarity.  Simon sets it
 	// during Navigator startup, after drawing the dark-on-light boot hourglass.
 	const bool reverse_video = BIT(m_crtc_regs[0xc2], 0);
@@ -3748,6 +4489,23 @@ static INPUT_PORTS_START(ibmsimon)
 	PORT_CONFSETTING(0x04, "Roam")
 	PORT_CONFSETTING(0x05, "Alternate Roam")
 
+	PORT_START("MAIN_BATTERY")
+#if defined(__ANDROID__) || defined(_WIN32)
+	PORT_CONFNAME(0x03, 2, "Main Battery")
+	PORT_CONFSETTING(2, "Follow Host Battery")
+#else
+	PORT_CONFNAME(0x03, 0, "Main Battery")
+#endif
+	PORT_CONFSETTING(0, "Normal")
+	PORT_CONFSETTING(1, "Low")
+
+	// The RJ11 adapter and XT keyboard share the physical 33-pin connector.
+	PORT_START("EXTERNAL_CONNECTOR")
+	PORT_CONFNAME(0x03, EXTERNAL_XT, "External Connector") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(ibmsimon_state::keyboard_connection_changed), 0)
+	PORT_CONFSETTING(EXTERNAL_NONE, "Disconnected")
+	PORT_CONFSETTING(EXTERNAL_XT, "XT Keyboard (ID pins open)")
+	PORT_CONFSETTING(EXTERNAL_RJ11, "RJ11 Modem Adapter")
+
 INPUT_PORTS_END
 
 static void simon_pcmcia_devices(device_slot_interface &device)
@@ -3758,6 +4516,7 @@ static void simon_pcmcia_devices(device_slot_interface &device)
 	device.option_add("melcard_1m", PCCARD_SRAM_MITSUBISHI_1M);
 	device.option_add("melcard_1800k", PCCARD_SRAM_MITSUBISHI_1800K);
 	device.option_add("melcard_4m", PCCARD_SRAM_MITSUBISHI_4M);
+	device.option_add("melcard_16m", PCCARD_SRAM_MITSUBISHI_16M);
 	device.option_add("linear16", FUJITSU_16MB_FLASH_CARD);
 	device.option_add("ata", ATA_FLASH_PCCARD);
 }
@@ -3767,8 +4526,10 @@ void ibmsimon_state::ibmsimon(machine_config &config)
 	V30(config, m_maincpu, 16_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &ibmsimon_state::mem_map);
 	m_maincpu->set_addrmap(AS_IO, &ibmsimon_state::io_map);
-	m_maincpu->set_irq_acknowledge_callback(FUNC(ibmsimon_state::irq_acknowledge));
-	GENERIC_KEYBOARD(config, "keyboard").set_keyboard_callback(FUNC(ibmsimon_state::dos_keyboard_put));
+	m_maincpu->set_irq_acknowledge_callback("mb:pic8259", FUNC(pic8259_device::inta_cb));
+	SIMON_XT_KEYBOARD(config, m_keyboard);
+	m_keyboard->out_clock_cb().set(FUNC(ibmsimon_state::keyboard_clock_w));
+	m_keyboard->out_data_cb().set(FUNC(ibmsimon_state::keyboard_data_w));
 
 	PCNOPPI_MOTHERBOARD(config, m_mb);
 	m_mb->set_cputag(m_maincpu);
@@ -3802,6 +4563,7 @@ void ibmsimon_state::ibmsimon(machine_config &config)
 	DAC_8BIT_R2R(config, m_voice_dac, 0).add_route(ALL_OUTPUTS, "mb:mono", 0.45);
 
 	RAM(config, m_mainram).set_default_size("512K");
+	NVRAM(config, m_clock_backup).set_custom_handler(FUNC(ibmsimon_state::default_clock_backup));
 
 	// A real Simon normally boots with an empty PC Card slot.  Making an SRAM
 	// card the slot default causes Card Services to probe it during CONFIG.SYS;
@@ -3811,8 +4573,8 @@ void ibmsimon_state::ibmsimon(machine_config &config)
 	PCCARD_SLOT(config, m_pcmcia, simon_pcmcia_devices, nullptr);
 	m_pcmcia->cd1().set(FUNC(ibmsimon_state::pcmcia_cd1_w));
 	m_pcmcia->cd2().set(FUNC(ibmsimon_state::pcmcia_cd2_w));
-	m_pcmcia->bvd1().set(FUNC(ibmsimon_state::pcmcia_bvd1_w));
-	m_pcmcia->bvd2().set(FUNC(ibmsimon_state::pcmcia_bvd2_w));
+	m_pcmcia->bvd1().set(FUNC(ibmsimon_state::pcmcia_bvd_w<0x20>));
+	m_pcmcia->bvd2().set(FUNC(ibmsimon_state::pcmcia_bvd_w<0x40>));
 	m_pcmcia->wp().set(FUNC(ibmsimon_state::pcmcia_wp_w));
 
 	screen_device &screen(SCREEN(config, "screen").set_lcd());

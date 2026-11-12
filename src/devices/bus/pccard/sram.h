@@ -116,6 +116,19 @@ private:
 	void memory_map(address_map &map) ATTR_COLD;
 };
 
+// Simon software-development card.  This deliberately exceeds the largest
+// factory card and is intended for experiments that need a full DOS program
+// tree, such as Windows 3.0 real mode.  The VG230 exposes 24 card-address bits,
+// so 16 MiB is the largest linear common-memory image it can address directly.
+class pccard_mitsubishi_16m_device : public pccard_mitsubishi_sram_device
+{
+public:
+	pccard_mitsubishi_16m_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0);
+
+private:
+	void memory_map(address_map &map) ATTR_COLD;
+};
+
 class pccard_centennial_sram_device : public pccard_sram_device
 {
 protected:
@@ -182,6 +195,7 @@ private:
 DECLARE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_1M, pccard_mitsubishi_mf31m1_lycat01_device)
 DECLARE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_1800K, pccard_mitsubishi_1800k_device)
 DECLARE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_4M, pccard_mitsubishi_4m_device)
+DECLARE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_16M, pccard_mitsubishi_16m_device)
 DECLARE_DEVICE_TYPE(PCCARD_SRAM_CENTENNIAL_1M, pccard_centennial_sl01m_15_11194_device)
 DECLARE_DEVICE_TYPE(PCCARD_SRAM_CENTENNIAL_2M, pccard_centennial_sl02m_15_11194_device)
 DECLARE_DEVICE_TYPE(PCCARD_SRAM_CENTENNIAL_4M, pccard_centennial_sl04m_15_11194_device)

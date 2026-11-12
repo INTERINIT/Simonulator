@@ -24,6 +24,7 @@
 DEFINE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_1M, pccard_mitsubishi_mf31m1_lycat01_device, "mitsubishi_mf31m1_lycat01", "Mitsubishi Melcard 1 MB SRAM")
 DEFINE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_1800K, pccard_mitsubishi_1800k_device, "mitsubishi_simon_1800k", "Simon-compatible 1.8 MB SRAM Development Card")
 DEFINE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_4M, pccard_mitsubishi_4m_device, "mitsubishi_simon_4m", "Simon 4 MB SRAM Development Card")
+DEFINE_DEVICE_TYPE(PCCARD_SRAM_MITSUBISHI_16M, pccard_mitsubishi_16m_device, "mitsubishi_simon_16m", "Simon 16 MB SRAM Experimental Card")
 
 // devices with attribute memory
 DEFINE_DEVICE_TYPE(PCCARD_SRAM_CENTENNIAL_1M, pccard_centennial_sl01m_15_11194_device, "centennial_sl01m_15_11194", "Centennial 1 MB SRAM")
@@ -274,6 +275,18 @@ pccard_mitsubishi_4m_device::pccard_mitsubishi_4m_device(const machine_config &m
 void pccard_mitsubishi_4m_device::memory_map(address_map &map)
 {
 	map(0x000000, 0x3fffff).ram().share("sram");
+}
+
+pccard_mitsubishi_16m_device::pccard_mitsubishi_16m_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock) :
+	pccard_mitsubishi_sram_device(mconfig, PCCARD_SRAM_MITSUBISHI_16M, tag, owner, clock)
+{
+	m_memory_space_config = address_space_config("memory", ENDIANNESS_LITTLE, 16, 24, 0, address_map_constructor(FUNC(pccard_mitsubishi_16m_device::memory_map), this));
+	m_attribute_space_config = address_space_config("attribute", ENDIANNESS_LITTLE, 16, 14, 0);
+}
+
+void pccard_mitsubishi_16m_device::memory_map(address_map &map)
+{
+	map(0x000000, 0xffffff).ram().share("sram");
 }
 
 

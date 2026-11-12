@@ -1,53 +1,63 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)]
-    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Container })]
-    [string]$MameRoot
+    [string]$MameRoot,
+    [string]$OverlayRoot = (Split-Path -Parent $PSScriptRoot)
 )
 
 $ErrorActionPreference = 'Stop'
-
-$repositoryRoot = Split-Path -Parent $PSScriptRoot
 $MameRoot = (Resolve-Path -LiteralPath $MameRoot).Path
-$listPath = Join-Path $MameRoot 'src\mame\mame.lst'
-if (-not (Test-Path -LiteralPath $listPath -PathType Leaf)) {
-    throw "Not a MAME source tree (missing $listPath)"
-}
+$OverlayRoot = (Resolve-Path -LiteralPath $OverlayRoot).Path
 
-$overlayFiles = @(
-    @{ Source = Join-Path $repositoryRoot 'src\mame\ibm\simon.cpp'; Destination = Join-Path $MameRoot 'src\mame\ibm\simon.cpp' },
-    @{ Source = Join-Path $repositoryRoot 'src\mame\layout\ibmsimon.lay'; Destination = Join-Path $MameRoot 'src\mame\layout\ibmsimon.lay' }
+# Each path is relative to the upstream MAME tree. Keeping an explicit list
+# also lets a missing release source fail before any destination is changed.
+$files = @(
+    'scripts/src/main.lua'
+    'scripts/src/osd/sdl3.lua'
+    'src/devices/bus/pccard/sram.cpp'
+    'src/devices/bus/pccard/sram.h'
+    'src/devices/machine/genpc.cpp'
+    'src/devices/machine/genpc.h'
+    'src/devices/machine/pckeybrd.cpp'
+    'src/emu/crsshair.cpp'
+    'src/emu/crsshair.h'
+    'src/frontend/mame/ui/ui.cpp'
+    'src/frontend/mame/ui/ui.h'
+    'src/mame/ibm/simon.cpp'
+    'src/mame/ibm/simon_kbd.cpp'
+    'src/mame/ibm/simon_kbd.h'
+    'src/mame/layout/ibmsimon.lay'
+    'src/osd/modules/lib/osdlib_win32.cpp'
+    'src/osd/sdl3/android_main.cpp'
+    'src/osd/windows/window.cpp'
+    'src/osd/windows/window.h'
 )
 
-foreach ($file in $overlayFiles) {
-    if (-not (Test-Path -LiteralPath $file.Source -PathType Leaf)) {
-        throw "Overlay source is missing: $($file.Source)"
-    }
-    $parent = Split-Path -Parent $file.Destination
-    if ($PSCmdlet.ShouldProcess($parent, "Create directory for $($file.Destination)")) {
-        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    }
-    if ($PSCmdlet.ShouldProcess($file.Destination, "Install $($file.Source)")) {
-        Copy-Item -LiteralPath $file.Source -Destination $file.Destination -Force
+$listPath = Join-Path $MameRoot 'src/mame/mame.lst'
+$list = [IO.File]::ReadAllText($listPath)
+foreach ($relative in $files) {
+    $source = Join-Path $OverlayRoot $relative
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Missing overlay source: $source"
     }
 }
-
-# The driver list is required for this system to be registered in a MAME
-# subtarget.  Insert our entry before the nearby IBM Portable PC source block;
-# the operation is deliberately idempotent.
-$listText = [System.IO.File]::ReadAllText($listPath)
-if ($listText -notmatch '(?m)^@source:ibm/simon\.cpp\r?$') {
-	$newLine = if ($listText.Contains("`r`n")) { "`r`n" } else { "`n" }
-	$entry = "@source:ibm/simon.cpp${newLine}ibmsimon${newLine}${newLine}"
-    $anchor = '@source:ibm/ptpc110.cpp'
-    $index = $listText.IndexOf($anchor, [System.StringComparison]::Ordinal)
-    if ($index -lt 0) {
-        throw "Could not find expected insertion point '$anchor' in $listPath"
-    }
-    $updatedText = $listText.Insert($index, $entry)
-    if ($PSCmdlet.ShouldProcess($listPath, 'Register ibmsimon driver')) {
-        [System.IO.File]::WriteAllText($listPath, $updatedText, [System.Text.UTF8Encoding]::new($false))
+if ($OverlayRoot -ne $MameRoot) {
+    foreach ($relative in $files) {
+        $source = Join-Path $OverlayRoot $relative
+        $target = Join-Path $MameRoot $relative
+        if ($PSCmdlet.ShouldProcess($target, 'Install MAME source')) {
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+            Copy-Item -LiteralPath $source -Destination $target -Force
+        }
     }
 }
-
-Write-Host "Simonulator overlay installed in $MameRoot"
+if ($list -notmatch '(?m)^@source:ibm/simon\.cpp\r?$') {
+    $nl = if ($list.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $entry = "@source:ibm/simon.cpp${nl}ibmsimon${nl}${nl}"
+    $offset = $list.IndexOf('@source:ibm/ptpc110.cpp', [StringComparison]::Ordinal)
+    if ($offset -lt 0) { $list = $list.TrimEnd() + $nl + $nl + $entry }
+    else { $list = $list.Insert($offset, $entry) }
+    if ($PSCmdlet.ShouldProcess($listPath, 'Register ibmsimon')) {
+        [IO.File]::WriteAllText($listPath, $list, [Text.UTF8Encoding]::new($false))
+    }
+}
