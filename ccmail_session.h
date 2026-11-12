@@ -19,12 +19,15 @@ public:
 
     auto take_login() { return std::exchange(credentials, std::nullopt); }
     const postoffice::Account &account() const { return user; }
+    bool take_office_mismatch() { return std::exchange(office_mismatch, false); }
 
     std::vector<std::string> login_result(bool ok) {
         if (phase != Phase::Authenticating) return {};
         phase = ok ? Phase::ConfirmOffice : Phase::Rejected;
         if (ok) return {std::string(1, char(Command::Accepted)), office_identity()};
-        return {std::string(1, char(Command::PasswordRejected))};
+        // Lotus Router sends 0x0098 (little endian) after the rejection.
+        // RCONNECT reads all three bytes before returning RCON8 to Mail.
+        return {std::string{char(Command::PasswordRejected), char(0x98), char(0)}};
     }
 
     std::vector<std::string> receive(std::string_view data) {
@@ -63,13 +66,11 @@ public:
                 field.resize(end);
                 if (phase == Phase::User) {
                     user = postoffice::find_account(field);
-                    if (user) {
-                        reply.emplace_back(1, char(Command::RequestPassword));
-                        phase = Phase::Password;
-                    } else {
-                        reply.push_back(office_identity(Command::NotFound));
-                        phase = Phase::Rejected;
-                    }
+                    // 0x83 plus the office name grants a read-only guest
+                    // connection on Lotus Router. This post office requires
+                    // an account, so all clients follow its password challenge.
+                    reply.emplace_back(1, char(Command::RequestPassword));
+                    phase = Phase::Password;
                 } else {
                     credentials.emplace(std::move(field));
                     phase = Phase::Authenticating;
@@ -85,6 +86,7 @@ public:
                 }
                 break;
             case Phase::ConfirmOffice:
+                office_mismatch = first == Command::NotFound;
                 phase = first == Command::Accepted ? Phase::Transfer : Phase::Rejected;
                 break;
             case Phase::Transfer:
@@ -130,6 +132,7 @@ private:
     enum class Phase { Hello, User, Password, Authenticating, ConfirmOffice, Transfer,
         UploadHeader, UploadContent, Offer, Download, Rejected, Closed };
     Phase phase = Phase::Hello;
+    bool office_mismatch = false;
     std::string pending;
     postoffice::Account user;
     std::optional<std::string> credentials;
@@ -146,9 +149,8 @@ private:
         }
     }
 
-    static std::string office_identity(int status = 0) {
+    static std::string office_identity() {
         std::string record;
-        if (status) record.push_back(char(status));
         record.push_back(char(office.size() + 1));
         record.append(office);
         record.push_back('\0');

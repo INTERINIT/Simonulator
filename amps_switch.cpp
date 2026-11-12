@@ -178,15 +178,16 @@ struct DtmfDetector {
         return q1 * q1 + q2 * q2 - coefficient * q1 * q2;
     }
 
-    std::optional<char> push(const std::vector<std::uint8_t> &pcm) {
+    std::string push(const std::vector<std::uint8_t> &pcm) {
+        std::string digits;
         for (std::uint8_t byte : pcm) {
             samples.push_back((int(byte) - 128) / 128.0);
             if (samples.size() < 205) continue;
             static constexpr std::array<double, 4> lows{697, 770, 852, 941};
-            static constexpr std::array<double, 3> highs{1209, 1336, 1477};
-            static constexpr char keys[4][3]{{'1','2','3'}, {'4','5','6'}, {'7','8','9'}, {'*','0','#'}};
+            static constexpr std::array<double, 4> highs{1209, 1336, 1477, 1633};
+            static constexpr char keys[4][4]{{'1','2','3','A'}, {'4','5','6','B'}, {'7','8','9','C'}, {'*','0','#','D'}};
             std::array<double, 4> lp{};
-            std::array<double, 3> hp{};
+            std::array<double, 4> hp{};
             for (std::size_t i = 0; i < lp.size(); ++i) lp[i] = power(samples, lows[i]);
             for (std::size_t i = 0; i < hp.size(); ++i) hp[i] = power(samples, highs[i]);
             const auto li = std::size_t(std::max_element(lp.begin(), lp.end()) - lp.begin());
@@ -194,9 +195,16 @@ struct DtmfDetector {
             double low_second = 0.0, high_second = 0.0;
             for (std::size_t i = 0; i < lp.size(); ++i) if (i != li) low_second = std::max(low_second, lp[i]);
             for (std::size_t i = 0; i < hp.size(); ++i) if (i != hi) high_second = std::max(high_second, hp[i]);
-            const double energy = lp[li] + hp[hi];
+            double window_energy = 0.0;
+            for (double sample : samples) window_energy += sample * sample;
+            // One sinusoid at a bin centre contributes N * sum(x²) / 2.
+            // Require both groups and most of the window's energy in the
+            // pair. A strong single tone leaks into every other Goertzel bin.
+            const double pair_power = lp[li] + hp[hi];
+            const bool tonal = pair_power > 0.65 * samples.size() * window_energy / 2.0;
+            const bool balanced = hp[hi] > lp[li] * 0.125 && hp[hi] < lp[li] * 3.2;
             const bool dominant = lp[li] > low_second * 2.5 && hp[hi] > high_second * 2.5;
-            const char found = energy > 18.0 && dominant ? keys[li][hi] : 0;
+            const char found = pair_power > 18.0 && dominant && tonal && balanced ? keys[li][hi] : 0;
             samples.clear();
             if (!found) {
                 if (++quiet >= 2) reported = 0;
@@ -211,10 +219,10 @@ struct DtmfDetector {
                 // A held key is one digit.  Two quiet detection windows rearm
                 // the same digit; a stable different tone may start immediately.
                 reported = found;
-                return found;
+                digits.push_back(found);
             }
         }
-        return std::nullopt;
+        return digits;
     }
 };
 
@@ -689,18 +697,18 @@ private:
         } else if (source.wireline_state != WirelineState::DialTone && source.wireline_state != WirelineState::Collecting) {
             return;
         }
-        if (const auto digit = source.wireline_dtmf.push(decode_hex(hex))) {
+        for (char digit : source.wireline_dtmf.push(decode_hex(hex))) {
             if (source.wireline_state == WirelineState::Connected) {
                 if (Client *peer = find(source.peer))
-                    send_line(*peer, "E DTMF " + std::to_string(source.wireline_number) + " " + std::string(1, *digit));
-                return;
+                    send_line(*peer, "E DTMF " + std::to_string(source.wireline_number) + " " + std::string(1, digit));
+                continue;
             }
             if (source.wireline_digits.size() >= 32) return;
-            source.wireline_digits.push_back(*digit);
+            source.wireline_digits.push_back(digit);
             source.wireline_state = WirelineState::Collecting;
             source.wireline_digit_due = Clock::now() + 2s;
             log("Wall-jack DTMF digit from {}: {}",
-                "固定电话 {} 的 DTMF 拨号：{}", source.wireline_number, *digit);
+                "固定电话 {} 的 DTMF 拨号：{}", source.wireline_number, digit);
         }
     }
 
@@ -1027,12 +1035,12 @@ private:
         if (Client *peer = find(source.peer); peer && peer->state == UnitState::Connected)
             send_line(*peer, (peer->wireline_offhook ? "M V Y " : "Y ") + hex);
         const auto pcm = decode_hex(hex);
-        if (const auto digit = source.dtmf.push(pcm)) {
+        for (char digit : source.dtmf.push(pcm)) {
             log("In-band DTMF from {}: {}",
-                "来自 {} 的带内 DTMF：{}", source.number, *digit);
+                "来自 {} 的带内 DTMF：{}", source.number, digit);
             if (Client *peer = find(source.peer))
-                send_line(*peer, "E DTMF " + std::to_string(source.number) + " " + std::string(1, *digit));
-            if (source.service == Service::Pager) pager_digit(source, *digit);
+                send_line(*peer, "E DTMF " + std::to_string(source.number) + " " + std::string(1, digit));
+            if (source.service == Service::Pager) pager_digit(source, digit);
         }
     }
 
@@ -1044,8 +1052,16 @@ private:
         client.mail_message_mode = false;
     }
 
-    void finish_mail_login(Client &client, bool accepted) {
+    void finish_mail_login(Client &client, bool accepted, bool busy = false) {
         if (client.mail_native_mode) {
+            if (!accepted) {
+                if (busy)
+                    log("Simon {}: post office busy during sign-in", "Simon {}：邮局繁忙，当前无法登录", client.number);
+                else if (!client.mail_session.account())
+                    log("Simon {}: unregistered mailbox", "Simon {}：邮箱未注册", client.number);
+                else
+                    log("Simon {}: mailbox password rejected", "Simon {}：邮箱密码错误", client.number);
+            }
             auto wire = client.mail_link.send(client.mail_session.login_result(accepted));
             if (!wire.empty()) send_modem(client, wire);
             return;
@@ -1073,7 +1089,7 @@ private:
             action(std::move(reply));
         })) {
             client.login_request = 0;
-            finish_mail_login(client, false);
+            finish_mail_login(client, false, true);
         }
     }
 
@@ -1231,6 +1247,9 @@ private:
             const std::string_view fragment(reinterpret_cast<const char *>(bytes.data()), bytes.size());
             const auto reply = client.mail_link.receive(fragment, client.mail_session);
             if (!reply.empty()) send_modem(client, reply);
+            if (client.mail_session.take_office_mismatch())
+                log("Simon {}: post office name mismatch, expected {}", "Simon {}：邮局名称不符，应填写 {}",
+                    client.number, postoffice::office_name);
             if (auto login = client.mail_session.take_login())
                 begin_mail_login(client, client.mail_session.account(), std::move(*login));
             return;

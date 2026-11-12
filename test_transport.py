@@ -440,6 +440,49 @@ def test_fax_bearer(source, target):
     print(f"PASS streaming Class 1 carrier: {len(page)} bytes with receiver pacing")
 
 
+def test_dtmf(port):
+    caller, peer = Handset(port), Handset(port)
+    try:
+        caller.send(f"O {peer.number}")
+        peer.wait_for(f"R {caller.number}")
+        peer.send("A")
+        caller.wait_for("C")
+        peer.wait_for("C")
+
+        rows = (697, 770, 852, 941)
+        cols = (1209, 1336, 1477, 1633)
+        keys = "123A456B789C*0#D"
+        pcm = bytearray()
+
+        def tone(components):
+            for n in range(960):
+                pcm.append(round(128 + sum(level * math.sin(2 * math.pi * f * n / 8000 + phase)
+                                           for f, level, phase in components)))
+            pcm.extend(bytes([128]) * 640)
+
+        # Strong sinusoidal leakage previously made the Android 953 Hz
+        # microphone check report '*'. Include every keypad bin alone too.
+        for frequency in (577, 953, *rows, *cols):
+            tone(((frequency, 112, 0.3),))
+        for row in rows:
+            for col in cols:
+                tone(((row, 25, 0.1), (col, 25, 0.7)))
+        # Unequal row/column power on working telephone paths.
+        tone(((697, 50, 0.2), (1209, 20, 0.6)))
+        tone(((941, 25, 0.3), (1633, 39, 0.9)))
+        for offset in range(0, len(pcm), 160):
+            caller.send("Y " + pcm[offset:offset + 160].hex())
+        events = peer.drain(0.7)
+        heard = "".join(line.split()[-1] for line in events if line.startswith("E DTMF "))
+        assert heard == keys + "1D", f"Unexpected in-band keypad events: {heard!r}"
+        relayed = b"".join(bytes.fromhex(line[2:]) for line in events if line.startswith("Y "))
+        assert relayed == pcm, "DTMF detection changed the relayed audio"
+        print("PASS single tones including 953 Hz rejected, all 16 DTMF pairs detected, PCM unchanged")
+    finally:
+        caller.close()
+        peer.close()
+
+
 def test_switch(port):
     units = []
     flood_stop = threading.Event()
@@ -545,6 +588,7 @@ def main():
             test_radio_power(args.port)
             test_wireline_voice(args.port)
             test_incoming_wireline(args.port)
+            test_dtmf(args.port)
             test_switch(args.port)
         finally:
             process.terminate()
