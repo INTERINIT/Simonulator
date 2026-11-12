@@ -69,6 +69,7 @@ constexpr UINT WM_SWITCH_LOG = WM_APP + 1;
 constexpr UINT WM_SWITCH_REFRESH = WM_APP + 2;
 constexpr UINT WM_MAIL_REGISTERED = WM_APP + 3;
 constexpr UINT WM_MAILBOXES_CHANGED = WM_APP + 4;
+constexpr UINT WM_MAILBOX_REMOVED = WM_APP + 5;
 
 enum ControlId : int {
     IDC_UNITS = 100,
@@ -91,7 +92,7 @@ enum ControlId : int {
     IDC_FROM_LABEL, IDC_TO_LABEL, IDC_PAGE_TO_LABEL, IDC_DIGITS_LABEL, IDC_PROFILE_LABEL,
     IDC_MAIL_NAME_LABEL, IDC_PASSWORD_LABEL, IDC_ADDRESS_LABEL, IDC_PORT_LABEL,
     IDC_SIGNAL_LABEL, IDC_OPERATOR_LABEL,
-    IDC_MAIL_LIST, IDC_MAIL_COUNT, IDC_MAIL_STATUS,
+    IDC_MAIL_LIST, IDC_MAIL_COUNT, IDC_MAIL_STATUS, IDC_DELETE_MAILBOX,
     IDM_ENGLISH = 40001, IDM_CHINESE, IDM_MAILBOXES,
 };
 
@@ -218,9 +219,19 @@ struct DtmfDetector {
 };
 
 struct MailMessage {
-    std::string to;
+    postoffice::Account to;
     std::string subject;
     std::string body;
+    bool body_started = false;
+    std::size_t received = 0;
+
+    void append(const std::string &line) {
+        received += line.size() + 2;
+        if (!body_started && line.empty()) body_started = true;
+        else if (!body_started && line.starts_with("TO:")) to = postoffice::find_account(trim(line.substr(3)));
+        else if (!body_started && line.starts_with("SUBJECT:")) subject = trim(line.substr(8));
+        else if (body_started || !line.starts_with("FROM:")) body += line + "\r\n";
+    }
 };
 
 struct Client : switch_store::Profile {
@@ -242,13 +253,13 @@ struct Client : switch_store::Profile {
     std::size_t tone_sample = 0;
     Service service = Service::None;
     std::string service_input;
-    std::string mail_user;
+    postoffice::Account mail_account;
     bool mail_authenticated = false;
     bool mail_message_mode = false;
     bool mail_native_mode = false;
     ccmail::Link mail_link;
     ccmail::Session mail_session;
-    std::string mail_message;
+    MailMessage mail_message;
     std::uint64_t login_request = 0;
     std::string after_login;
     std::string pager_target;
@@ -290,7 +301,7 @@ struct Call {
     Clock::time_point ring_due{};
 };
 
-enum class ActionType { Call, Connect, Hang, Page, Profile, LoginReply, WebReply };
+enum class ActionType { Call, Connect, Hang, Page, Profile, LoginReply, WebReply, MailboxRemoved };
 struct Action {
     ActionType type{};
     int from = 0;
@@ -301,6 +312,7 @@ struct Action {
     std::string operator_name{};
     std::uint64_t request = 0;
     bool accepted = false;
+    postoffice::Account mailbox{};
 };
 
 struct UnitSnapshot {
@@ -343,6 +355,14 @@ public:
             const bool created = postoffice::create(name, password);
             PostMessageW(window, WM_MAIL_REGISTERED, created, 0);
             if (created) PostMessageW(window, WM_MAILBOXES_CHANGED, 0, 0);
+        });
+    }
+
+    bool remove_mailbox(std::string name) {
+        return m_accounts.submit([this, name = std::move(name)] {
+            Action reply{ActionType::MailboxRemoved};
+            reply.mailbox = postoffice::remove_account(name);
+            action(std::move(reply));
         });
     }
 
@@ -728,10 +748,11 @@ private:
                 send_line(source, "C");
             } else send_line(source, "M C 2400");
             if (service == Service::Mail) {
-                source.mail_user.clear();
+                source.mail_account = {};
+                source.mail_session.reset();
                 source.mail_link = {};
                 source.mail_authenticated = source.mail_message_mode = source.mail_native_mode = false;
-                source.mail_message.clear();
+                source.mail_message = {};
             }
             log("2400 bit/s data call: {} -> {}",
                 "2400 bit/s 数据呼叫：{} -> {}", source.number, number);
@@ -1016,21 +1037,10 @@ private:
     }
 
     void finish_mail(Client &client) {
-        MailMessage message;
-        std::istringstream stream(client.mail_message);
-        std::string line;
-        bool body = false;
-        while (std::getline(stream, line)) {
-            line = trim(line);
-            if (!body && line.empty()) { body = true; continue; }
-            if (!body && line.rfind("TO:", 0) == 0) message.to = trim(line.substr(3));
-            else if (!body && line.rfind("FROM:", 0) == 0) continue; // use authenticated sender
-            else if (!body && line.rfind("SUBJECT:", 0) == 0) message.subject = trim(line.substr(8));
-            else { message.body += line; message.body += "\r\n"; }
-        }
-        const bool ok = postoffice::deliver(client.mail_user, message.to, message.subject.substr(0,128), message.body);
+        const auto &message = client.mail_message;
+        const bool ok = postoffice::deliver(client.mail_account, message.to, message.subject.substr(0, 128), message.body);
         send_modem(client, ok ? "+OK QUEUED\r\nMAIL> " : "-ERR NO DELIVERY\r\nMAIL> ");
-        client.mail_message.clear();
+        client.mail_message = {};
         client.mail_message_mode = false;
     }
 
@@ -1049,16 +1059,17 @@ private:
             mail_command(client, std::move(line));
     }
 
-    void begin_mail_login(Client &client, std::string name, std::string password) {
+    void begin_mail_login(Client &client, postoffice::Account account, std::string password) {
         const auto id = m_next_request++;
         client.login_request = id;
+        client.mail_account = account;
         client.mail_authenticated = false;
-        if (!m_accounts.submit([this, number = client.number, id, name = std::move(name),
+        if (!m_accounts.submit([this, number = client.number, id, account = std::move(account),
                 password = std::move(password)] {
             Action reply{ActionType::LoginReply};
             reply.from = number;
             reply.request = id;
-            reply.accepted = postoffice::login(name, password);
+            reply.accepted = postoffice::login(account, password);
             action(std::move(reply));
         })) {
             client.login_request = 0;
@@ -1081,30 +1092,30 @@ private:
         }
         if (client.mail_message_mode) {
             if (line == ".") finish_mail(client);
-            else if (client.mail_message.size()+line.size()+2 <= 32768) { client.mail_message += line; client.mail_message += "\r\n"; }
-            else { client.mail_message_mode=false; client.mail_message.clear(); send_modem(client,"-ERR MESSAGE TOO LARGE\r\n"); }
+            else if (client.mail_message.received + line.size() + 2 <= 32768) client.mail_message.append(line);
+            else { client.mail_message_mode=false; client.mail_message = {}; send_modem(client,"-ERR MESSAGE TOO LARGE\r\n"); }
             return;
         }
         std::string upper = line;
         std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return char(std::toupper(c)); });
         if (upper.rfind("USER ", 0) == 0) {
             client.mail_authenticated = false;
-            client.mail_user = trim(line.substr(5));
+            client.mail_account = postoffice::find_account(trim(line.substr(5)));
             send_modem(client, "+OK PASSWORD\r\nPASS ");
         } else if (upper.rfind("PASS ", 0) == 0) {
-            begin_mail_login(client, client.mail_user, line.substr(5));
+            begin_mail_login(client, client.mail_account, line.substr(5));
         } else if (!client.mail_authenticated && upper != "QUIT") {
             send_modem(client,"-ERR LOGIN REQUIRED\r\n");
         } else if (upper == "SEND" || upper == "DATA") {
             client.mail_message_mode = true;
-            client.mail_message.clear();
+            client.mail_message = {};
             send_modem(client, "+OK END WITH <CRLF>.<CRLF>\r\n");
         } else if (upper == "LIST") {
-            send_modem(client, postoffice::inbox(client.mail_user,0)+"\r\nMAIL> ");
+            send_modem(client, postoffice::inbox(client.mail_account,0)+"\r\nMAIL> ");
         } else if (upper.rfind("RETR ",0)==0) {
             int id=0;
             try { id=std::stoi(line.substr(5)); } catch (...) { }
-            send_modem(client,(id>0 ? postoffice::inbox(client.mail_user,id) : "-ERR NO MESSAGE")+std::string("\r\nMAIL> "));
+            send_modem(client,(id>0 ? postoffice::inbox(client.mail_account,id) : "-ERR NO MESSAGE")+std::string("\r\nMAIL> "));
         } else if (upper == "QUIT") {
             send_modem(client, "+OK BYE\r\n");
             send_line(client, "M H");
@@ -1221,7 +1232,7 @@ private:
             const auto reply = client.mail_link.receive(fragment, client.mail_session);
             if (!reply.empty()) send_modem(client, reply);
             if (auto login = client.mail_session.take_login())
-                begin_mail_login(client, std::move(login->first), std::move(login->second));
+                begin_mail_login(client, client.mail_session.account(), std::move(*login));
             return;
         }
         for (auto byte : bytes) {
@@ -1560,6 +1571,20 @@ private:
             actions.swap(m_actions);
         }
         for (Action &action : actions) {
+            if (action.type == ActionType::MailboxRemoved) {
+                if (action.mailbox) {
+                    for (auto &[number, unit] : m_clients) {
+                        if (unit->service != Service::Mail) continue;
+                        if (unit->mail_account == action.mailbox || unit->mail_session.account() == action.mailbox) {
+                            send_line(*unit, "M H");
+                            release(number, true);
+                        }
+                    }
+                    PostMessageW(m_notify, WM_MAILBOXES_CHANGED, 0, 0);
+                }
+                PostMessageW(m_notify, WM_MAILBOX_REMOVED, bool(action.mailbox), 0);
+                continue;
+            }
             // The worker never owns a Client. A hang-up and redial on the
             // same socket must not apply an earlier request to the new session.
             if (action.type == ActionType::LoginReply || action.type == ActionType::WebReply) {
@@ -1568,7 +1593,7 @@ private:
                 if (action.type == ActionType::LoginReply && client->service == Service::Mail &&
                         client->login_request == action.request) {
                     client->login_request = 0;
-                    finish_mail_login(*client, action.accepted);
+                    finish_mail_login(*client, action.accepted && postoffice::find_account(client->mail_account.name) == client->mail_account);
                 }
                 if (action.type == ActionType::WebReply && client->service == Service::Web &&
                         client->web_request == action.request) {
@@ -1912,6 +1937,7 @@ void refresh_list() {
 }
 
 bool g_registration_pending = false;
+bool g_removal_pending = false;
 UiLabel g_mail_status{L"", L""};
 
 void set_mail_status(UiLabel status) {
@@ -1956,6 +1982,7 @@ void update_mailbox_interface() {
     SetDlgItemTextW(g_mailboxes, IDC_MAIL_NAME_LABEL, display({L"Mailbox name", L"邮箱账号"}));
     SetDlgItemTextW(g_mailboxes, IDC_PASSWORD_LABEL, display({L"Password", L"邮箱密码"}));
     SetDlgItemTextW(g_mailboxes, IDC_REGISTER, display({L"Register mailbox", L"注册邮箱"}));
+    SetDlgItemTextW(g_mailboxes, IDC_DELETE_MAILBOX, display({L"Delete selected account…", L"删除所选账户…"}));
     SetDlgItemTextW(g_mailboxes, IDC_MAIL_STATUS, display(g_mail_status));
     HWND list = GetDlgItem(g_mailboxes, IDC_MAIL_LIST);
     LVCOLUMNW column{};
@@ -1982,6 +2009,8 @@ LRESULT CALLBACK mailbox_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
         }
         HWND button = control(L"BUTTON", L"", WS_TABSTOP | BS_DEFPUSHBUTTON, 0,0,0,0, IDC_REGISTER, window);
         EnableWindow(button, !g_registration_pending);
+        HWND remove = control(L"BUTTON", L"", WS_TABSTOP | BS_PUSHBUTTON, 0,0,0,0, IDC_DELETE_MAILBOX, window);
+        EnableWindow(remove, FALSE);
         if (g_font) EnumChildWindows(window, [](HWND child, LPARAM font) -> BOOL {
             SendMessageW(child, WM_SETFONT, font, TRUE);
             return TRUE;
@@ -1999,7 +2028,8 @@ LRESULT CALLBACK mailbox_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
         MoveWindow(list, 12, 12, width - 24, list_height, TRUE);
         ListView_SetColumnWidth(list, 0, LVSCW_AUTOSIZE_USEHEADER);
         const int top = list_height + 21;
-        MoveWindow(GetDlgItem(window, IDC_MAIL_COUNT), 12, top, width - 24, 20, TRUE);
+        MoveWindow(GetDlgItem(window, IDC_MAIL_COUNT), 12, top + 2, width - 196, 20, TRUE);
+        MoveWindow(GetDlgItem(window, IDC_DELETE_MAILBOX), width - 172, top - 3, 160, 24, TRUE);
         for (int i = 0; i < 2; ++i) {
             const int y = top + 25 + 29 * i;
             MoveWindow(GetDlgItem(window, i ? IDC_PASSWORD_LABEL : IDC_MAIL_NAME_LABEL), 12, y + 3, 89, 20, TRUE);
@@ -2009,8 +2039,37 @@ LRESULT CALLBACK mailbox_proc(HWND window, UINT message, WPARAM wparam, LPARAM l
         MoveWindow(GetDlgItem(window, IDC_MAIL_STATUS), 12, top + 85, width - 24, 42, TRUE);
         return 0;
     }
+    case WM_NOTIFY: {
+        auto *header = reinterpret_cast<NMHDR *>(lparam);
+        if (header->idFrom == IDC_MAIL_LIST && header->code == LVN_ITEMCHANGED) {
+            EnableWindow(GetDlgItem(window, IDC_DELETE_MAILBOX),
+                         !g_removal_pending && ListView_GetSelectedCount(header->hwndFrom) != 0);
+        }
+        break;
+    }
     case WM_COMMAND:
         if (LOWORD(wparam) == IDCANCEL) { DestroyWindow(window); return 0; }
+        if (LOWORD(wparam) == IDC_DELETE_MAILBOX && !g_removal_pending) {
+            HWND list = GetDlgItem(window, IDC_MAIL_LIST);
+            const int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+            if (selected < 0) return 0;
+            wchar_t account[33]{};
+            ListView_GetItemText(list, selected, 0, account, int(std::size(account)));
+            std::wstring prompt = display({L"Delete mailbox “", L"删除邮箱“"});
+            prompt += account;
+            prompt += display({L"” and its received mail from this server? Messages delivered to other accounts are kept.",
+                               L"”及它在此交换机上收到的邮件吗？已投递到其他邮箱的邮件会保留。"});
+            if (MessageBoxW(window, prompt.c_str(), display(kMailboxesTitle),
+                            MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return 0;
+            g_removal_pending = g_server->remove_mailbox(narrow(account));
+            if (g_removal_pending) {
+                EnableWindow(GetDlgItem(window, IDC_DELETE_MAILBOX), FALSE);
+                set_mail_status({L"Deleting mailbox…", L"正在删除邮箱…"});
+            } else {
+                set_mail_status({L"Post office busy. Please try again.", L"邮局正忙，请稍后再试。"});
+            }
+            return 0;
+        }
         if ((LOWORD(wparam) == IDC_REGISTER || LOWORD(wparam) == IDOK) && !g_registration_pending) {
             HWND password = GetDlgItem(window, IDC_MAIL_PASSWORD);
             g_registration_pending = g_server->register_mailbox(utf8_text(GetDlgItem(window, IDC_MAIL_NAME)), utf8_text(password));
@@ -2243,6 +2302,12 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         append_log({std::wstring(result.english) + L"\r\n", std::wstring(result.chinese) + L"\r\n"});
         return 0;
     }
+    case WM_MAILBOX_REMOVED:
+        g_removal_pending = false;
+        set_mail_status(wparam ? UiLabel{L"Mailbox deleted.", L"邮箱账户已删除。"}
+                               : UiLabel{L"Could not delete the mailbox.", L"无法删除该邮箱账户。"});
+        load_mailboxes();
+        return 0;
     case WM_MAILBOXES_CHANGED: load_mailboxes(); return 0;
     case WM_SWITCH_REFRESH: refresh_list(); return 0;
     case WM_DESTROY:

@@ -24,12 +24,46 @@ inline bool valid_name(const std::string &name) {
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == name.npos;
 }
 
-inline bool exists(const std::string &name) {
-    Database db;
-    Query lookup(db, "SELECT 1 FROM users WHERE name=?");
-    if (!lookup.s) return false;
+// A fresh random salt is generated at registration. Together with the name
+// it identifies this incarnation of a mailbox, including in existing databases.
+struct Account {
+    std::string name;
+    std::string instance;
+    explicit operator bool() const { return !instance.empty(); }
+    bool operator==(const Account &) const = default;
+};
+
+inline Account find_account(Database &db, const std::string &name) {
+    Query lookup(db, "SELECT name,hex(salt) FROM users WHERE name=?");
+    if (!lookup.s) return {};
     lookup.text(1, name);
-    return sqlite3_step(lookup.s) == SQLITE_ROW;
+    if (sqlite3_step(lookup.s) != SQLITE_ROW) return {};
+    return {lookup.col(0), lookup.col(1)};
+}
+
+inline Account find_account(const std::string &name) {
+    Database db;
+    return find_account(db, name);
+}
+
+inline Account remove_account(const std::string &name) {
+    Database db;
+    if (!db.ready || sqlite3_exec(db.db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) return {};
+    auto account = find_account(db, name);
+    if (!account) return {};
+    // An outgoing copy belongs to its recipient. Delete only this mailbox's
+    // incoming copies and their native envelopes, then the account itself.
+    for (const char *sql : {
+            "DELETE FROM ccmail_envelopes WHERE letter_id IN (SELECT id FROM letters WHERE recipient=?)",
+            "DELETE FROM letters WHERE recipient=?",
+            "DELETE FROM users WHERE name=?"}) {
+        Query remove(db, sql);
+        if (!remove.s) return {};
+        remove.text(1, account.name);
+        if (sqlite3_step(remove.s) != SQLITE_DONE) return {};
+    }
+    if (sqlite3_exec(db.db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) return {};
+    return account;
 }
 
 inline std::optional<std::vector<std::string>> mailbox_names() {
@@ -76,17 +110,18 @@ inline bool create(const std::string &name, const std::string &password) {
     return sqlite3_step(insert.s) == SQLITE_DONE;
 }
 
-inline bool login(const std::string &name, const std::string &password) {
-    if (!valid_name(name) || password.empty() || password.size() > 64) return false;
+inline bool login(const Account &account, const std::string &password) {
+    if (!account || password.empty() || password.size() > 64) return false;
     Salt salt;
     Key expected;
     {
         // End the SQLite reader before the CPU-intensive derivation so it
         // does not hold up new mail or registrations in another connection.
         Database db;
-        Query lookup(db, "SELECT salt,verifier FROM users WHERE name=?");
+        Query lookup(db, "SELECT salt,verifier FROM users WHERE name=? AND hex(salt)=?");
         if (!lookup.s) return false;
-        lookup.text(1, name);
+        lookup.text(1, account.name);
+        lookup.text(2, account.instance);
         if (sqlite3_step(lookup.s) != SQLITE_ROW ||
                 sqlite3_column_bytes(lookup.s, 0) != int(salt.size()) ||
                 sqlite3_column_bytes(lookup.s, 1) != int(expected.size())) return false;
@@ -100,28 +135,33 @@ inline bool login(const std::string &name, const std::string &password) {
     return difference == 0;
 }
 
-inline bool deliver(const std::string &from, const std::string &to,
+inline bool deliver(const Account &from, const Account &to,
         const std::string &subject, const std::string &body) {
     Database db;
     Query insert(db, "INSERT INTO letters(recipient,sender,subject,body) "
-        "SELECT name,?,?,? FROM users WHERE name=?");
+        "SELECT name,?,?,? FROM users WHERE name=? AND hex(salt)=? "
+        "AND EXISTS(SELECT 1 FROM users WHERE name=? AND hex(salt)=?)");
     if (!insert.s) return false;
-    insert.text(1, from);
+    insert.text(1, from.name);
     insert.text(2, subject);
     insert.text(3, body);
-    insert.text(4, to);
+    insert.text(4, to.name);
+    insert.text(5, to.instance);
+    insert.text(6, from.name);
+    insert.text(7, from.instance);
     return sqlite3_step(insert.s) == SQLITE_DONE && sqlite3_changes(db.db) == 1;
 }
 
-inline std::string inbox(const std::string &user, int id) {
+inline std::string inbox(const Account &user, int id) {
     Database db;
     Query messages(db, id
-        ? "SELECT sender,recipient,subject,body FROM letters WHERE recipient=? AND id=?"
-        : "SELECT id,sender,subject FROM letters WHERE recipient=? ORDER BY id DESC LIMIT 100");
+        ? "SELECT sender,recipient,subject,body FROM letters JOIN users ON recipient=name WHERE name=? AND hex(salt)=? AND id=?"
+        : "SELECT id,sender,subject FROM letters JOIN users ON recipient=name WHERE name=? AND hex(salt)=? ORDER BY id DESC LIMIT 100");
     if (!messages.s) return "-ERR STORAGE";
-    messages.text(1, user);
+    messages.text(1, user.name);
+    messages.text(2, user.instance);
     if (id) {
-        sqlite3_bind_int(messages.s, 2, id);
+        sqlite3_bind_int(messages.s, 3, id);
         if (sqlite3_step(messages.s) != SQLITE_ROW) return "-ERR NO MESSAGE";
         return "+OK\r\nFrom: " + messages.col(0) + "\r\nTo: " + messages.col(1) +
             "\r\nSubject: " + messages.col(2) + "\r\n\r\n" + messages.col(3) + ".";

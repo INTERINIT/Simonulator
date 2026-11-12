@@ -27,7 +27,7 @@ inline std::uint32_t dword(std::string_view data, std::size_t offset) {
 struct Message {
     sqlite3_int64 id = 0;
     std::string header, content, subject;
-    std::vector<std::string> recipients;
+    std::vector<postoffice::Account> recipients;
     std::size_t content_size = 0;
     unsigned addresses = 0;
 
@@ -52,27 +52,29 @@ struct Message {
             if (type == 5) subject = value;
             if (type == 3) {
                 ++addresses;
-                const bool found = postoffice::exists(value);
+                const auto found = postoffice::find_account(value);
                 replies.emplace_back(1, char(found ? Command::Accepted : Command::NotFound));
-                if (found && std::find(recipients.begin(), recipients.end(), value) == recipients.end())
-                    recipients.push_back(value);
+                if (found && std::find(recipients.begin(), recipients.end(), found) == recipients.end())
+                    recipients.push_back(found);
             }
             i += size;
         }
         return author && addresses != 0;
     }
 
-    bool deliver(const std::string &sender) const {
+    bool deliver(const postoffice::Account &sender) const {
         switch_store::Database db;
         if (!db.ready || sqlite3_exec(db.db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) return false;
+        if (!sender || postoffice::find_account(db, sender.name) != sender) return false;
         switch_store::Query letter(db, "INSERT INTO letters(recipient,sender,subject,body) VALUES(?,?,?,?)");
         switch_store::Query wire(db, "INSERT INTO ccmail_envelopes(letter_id,header,content) VALUES(?,?,?)");
         if (!letter.s || !wire.s) return false;
         const auto body = body_text();
         for (const auto &recipient : recipients) {
             sqlite3_reset(letter.s);
-            letter.text(1, recipient);
-            letter.text(2, sender);
+            if (postoffice::find_account(db, recipient.name) != recipient) return false;
+            letter.text(1, recipient.name);
+            letter.text(2, sender.name);
             letter.text(3, subject);
             letter.text(4, body);
             if (sqlite3_step(letter.s) != SQLITE_DONE) return false;
@@ -107,12 +109,14 @@ struct Message {
         return result;
     }
 
-    bool next_for(const std::string &user) {
+    bool next_for(const postoffice::Account &user) {
         switch_store::Database db;
         switch_store::Query next(db, "SELECT e.letter_id,e.header,e.content FROM ccmail_envelopes e "
-            "JOIN letters l ON l.id=e.letter_id WHERE l.recipient=? AND e.collected=0 ORDER BY l.id LIMIT 1");
+            "JOIN letters l ON l.id=e.letter_id JOIN users u ON l.recipient=u.name "
+            "WHERE u.name=? AND hex(u.salt)=? AND e.collected=0 ORDER BY l.id LIMIT 1");
         if (!next.s) return false;
-        next.text(1, user);
+        next.text(1, user.name);
+        next.text(2, user.instance);
         if (sqlite3_step(next.s) != SQLITE_ROW) return false;
         id = sqlite3_column_int64(next.s, 0);
         auto blob = [&](int col) {
@@ -124,12 +128,16 @@ struct Message {
         return true;
     }
 
-    bool collected() const {
+    bool collected(const postoffice::Account &user) const {
         switch_store::Database db;
-        switch_store::Query update(db, "UPDATE ccmail_envelopes SET collected=1 WHERE letter_id=?");
+        switch_store::Query update(db, "UPDATE ccmail_envelopes SET collected=1 WHERE letter_id=? AND "
+            "EXISTS (SELECT 1 FROM letters l JOIN users u ON l.recipient=u.name "
+            "WHERE l.id=ccmail_envelopes.letter_id AND u.name=? AND hex(u.salt)=?)");
         if (!update.s) return false;
         sqlite3_bind_int64(update.s, 1, id);
-        return sqlite3_step(update.s) == SQLITE_DONE;
+        update.text(2, user.name);
+        update.text(3, user.instance);
+        return sqlite3_step(update.s) == SQLITE_DONE && sqlite3_changes(db.db) == 1;
     }
 };
 

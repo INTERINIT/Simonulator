@@ -18,6 +18,7 @@ public:
     void reset() { *this = Session{}; }
 
     auto take_login() { return std::exchange(credentials, std::nullopt); }
+    const postoffice::Account &account() const { return user; }
 
     std::vector<std::string> login_result(bool ok) {
         if (phase != Phase::Authenticating) return {};
@@ -35,7 +36,7 @@ public:
                 if (pending.size() < 2) break;
                 const auto size = word(pending, 0);
                 if (pending.size() < 2u + size) break;
-                const bool valid = message.read_header(pending.substr(2, size), user, reply);
+                const bool valid = message.read_header(pending.substr(2, size), user.name, reply);
                 pending.erase(0, 2u + size);
                 if (!valid || message.recipients.empty()) {
                     reply.emplace_back(1, char(Command::Undeliverable));
@@ -61,8 +62,8 @@ public:
                 if (end == field.npos) { phase = Phase::Closed; continue; }
                 field.resize(end);
                 if (phase == Phase::User) {
-                    user = field;
-                    if (postoffice::exists(user)) {
+                    user = postoffice::find_account(field);
+                    if (user) {
                         reply.emplace_back(1, char(Command::RequestPassword));
                         phase = Phase::Password;
                     } else {
@@ -70,7 +71,7 @@ public:
                         phase = Phase::Rejected;
                     }
                 } else {
-                    credentials.emplace(user, std::move(field));
+                    credentials.emplace(std::move(field));
                     phase = Phase::Authenticating;
                 }
                 continue;
@@ -107,7 +108,7 @@ public:
                 // with 86. Only 87 means it committed the letter to disk.
                 if (first == Command::RequestContent && !message.content.empty()) reply.push_back(message.content);
                 if (first == Command::Stored) {
-                    if (message.collected()) offer_next(reply);
+                    if (message.collected(user)) offer_next(reply);
                     else { reply.emplace_back(1, char(Command::EndBatch)); phase = Phase::Closed; }
                 }
                 if (first == Command::Undeliverable) { reply.emplace_back(1, char(Command::EndBatch)); phase = Phase::Closed; }
@@ -130,8 +131,8 @@ private:
         UploadHeader, UploadContent, Offer, Download, Rejected, Closed };
     Phase phase = Phase::Hello;
     std::string pending;
-    std::string user;
-    std::optional<std::pair<std::string, std::string>> credentials;
+    postoffice::Account user;
+    std::optional<std::string> credentials;
     Message message;
 
     void offer_next(std::vector<std::string> &reply) {
